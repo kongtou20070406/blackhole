@@ -1,0 +1,1968 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly PROGRAM="${0##*/}"
+PROFILE="${BLACKHOLE_COLIMA_PROFILE:-default}"
+readonly DEFAULT_IMAGE="${BLACKHOLE_IMAGE:-blackhole-claude:latest}"
+HOME_VOLUME=""
+readonly COLIMA_DIR="${COLIMA_HOME:-${HOME}/.colima}"
+readonly STATE_DIR="${BLACKHOLE_STATE_DIR:-${HOME}/.blackhole}"
+readonly CLIPBOARD_DIR="${STATE_DIR}/clipboard"
+readonly CLIPBOARD_DISABLED="${STATE_DIR}/clipboard.disabled"
+
+# Effective image for the current project. A project can extend the base image
+# with its own Linux tools; resolve_project_image() overwrites this.
+IMAGE="$DEFAULT_IMAGE"
+PROJECT_DOCKERFILE=""
+
+# Resolve the installation directory even when this script is called through
+# the ~/.local/bin/claude symlink.
+source_path="${BASH_SOURCE[0]}"
+while [[ -L "$source_path" ]]; do
+    source_dir="$(cd -P "$(dirname "$source_path")" >/dev/null 2>&1 && pwd)"
+    source_path="$(readlink "$source_path")"
+    [[ "$source_path" != /* ]] && source_path="${source_dir}/${source_path}"
+done
+ROOT_DIR="$(cd -P "$(dirname "$source_path")/.." >/dev/null 2>&1 && pwd)"
+readonly ROOT_DIR
+
+log() {
+    printf 'blackhole: %s\n' "$*" >&2
+}
+
+die() {
+    printf 'blackhole: error: %s\n' "$*" >&2
+    exit 1
+}
+
+binding_file_for() {
+    local dir="$1"
+    local hash
+    hash="$(printf '%s' "$dir" | shasum -a 256 | awk '{ print substr($1, 1, 16) }')"
+    printf '%s/bindings/%s.binding' "$STATE_DIR" "$hash"
+}
+
+# Precedence: BLACKHOLE_COLIMA_PROFILE > per-directory binding > default.
+resolve_profile() {
+    if [[ -z "${BLACKHOLE_COLIMA_PROFILE:-}" ]]; then
+        local dir file bound
+        dir="$(pwd -P 2>/dev/null || pwd)"
+        # A binding applies to the whole project, including subdirectories.
+        while [[ -n "$dir" ]]; do
+            file="$(binding_file_for "$dir")"
+            if [[ -f "$file" ]]; then
+                bound="$(awk -F '=' '/^profile=/{ print $2; exit }' "$file")"
+                if [[ -n "$bound" ]]; then
+                    PROFILE="$bound"
+                    break
+                fi
+            fi
+            [[ "$dir" == "/" ]] && break
+            dir="$(dirname "$dir")"
+        done
+    fi
+    HOME_VOLUME="${BLACKHOLE_HOME_VOLUME:-blackhole-claude-home-${PROFILE}}"
+}
+
+profile_bind() {
+    local profile="${1:-}"
+    local target="${2:-$(pwd)}"
+    [[ -n "$profile" ]] || die "usage: blackhole bind <profile> [directory]"
+    [[ "$profile" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+        || die "invalid profile name: ${profile}"
+    [[ -d "$target" ]] || die "directory not found: ${target}"
+    require_host_tools
+
+    target="$(cd "$target" && pwd -P)"
+    if ! colima list -j 2>/dev/null | grep -Fq "\"name\":\"${profile}\""; then
+        log "warning: Colima profile '${profile}' does not exist yet"
+        log "create it with: colima start --profile ${profile} --vm-type vz --mount-type virtiofs --cpu 4 --memory 16 --disk 60"
+    fi
+
+    local file tmp
+    file="$(binding_file_for "$target")"
+    mkdir -p "$(dirname "$file")"
+    tmp="${file}.tmp.$$"
+    {
+        printf 'path=%s\n' "$target"
+        printf 'profile=%s\n' "$profile"
+        printf 'created=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp"
+    mv "$tmp" "$file"
+    log "bound ${target} -> profile '${profile}'"
+}
+
+profile_unbind() {
+    local target="${1:-$(pwd)}"
+    [[ -d "$target" ]] || die "directory not found: ${target}"
+    target="$(cd "$target" && pwd -P)"
+    local file
+    file="$(binding_file_for "$target")"
+    if [[ -f "$file" ]]; then
+        rm -f "$file"
+        log "unbound ${target}"
+    else
+        log "no binding for ${target}"
+    fi
+}
+
+profile_bindings() {
+    local rows=""
+    local file path profile
+    for file in "$STATE_DIR"/bindings/*.binding; do
+        [[ -f "$file" ]] || continue
+        path="$(awk -F '=' '/^path=/{ sub(/^path=/, ""); print; exit }' "$file")"
+        profile="$(awk -F '=' '/^profile=/{ print $2; exit }' "$file")"
+        rows+="${path}"$'\t'"${profile}"$'\n'
+    done
+    if [[ -z "$rows" ]]; then
+        printf 'No bound projects.\n'
+        return 0
+    fi
+    { printf 'PATH\tPROFILE\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  claude [claude-code arguments]
+  blackhole setup [--claude-version VERSION]
+  blackhole install [--prefix DIR] [--force]
+  blackhole status
+  blackhole bind <profile> [directory]
+  blackhole bindings
+  blackhole unbind [directory]
+  blackhole sessions
+  blackhole projects
+  blackhole profiles
+  blackhole resume [--profile NAME] [--dry-run] <session-id-prefix>
+  blackhole export [--profile NAME] [--output FILE] <session-id-prefix>
+  blackhole signal send --file PATH (--data JSON | --message TEXT | --stdin)
+  blackhole net off [--all | --profile NAME]
+  blackhole net on  [--all | --profile NAME]
+  blackhole net status [--all | --profile NAME]
+  blackhole net ipv6 off|on|status [--all | --profile NAME]
+  blackhole clipboard start|status|stop|disable|enable
+  blackhole net-watch start [--profile NAME] [--interval SECONDS] [--fail-after N] [--recover-after N] [--url URL] [--proxy URL]
+  blackhole net-watch status
+  blackhole net-watch stop
+  blackhole export-watch start [--profile NAME] [--interval SECONDS] <session-prefix>
+  blackhole export-watch status
+  blackhole export-watch stop [session-prefix]
+  blackhole update [--claude-version VERSION]
+  blackhole shell
+  blackhole help
+
+Run Claude Code inside the Colima VM with only the current directory mounted.
+Project changes are visible on both sides immediately. Claude credentials and
+settings are retained in a private Docker volume.
+
+Environment:
+  BLACKHOLE_COLIMA_PROFILE  Colima profile (default: default)
+  BLACKHOLE_IMAGE           Override the base image and disable project images
+  BLACKHOLE_HOME_VOLUME     Credential volume name
+  BLACKHOLE_STATE_DIR       Host state directory (default: ~/.blackhole)
+  BLACKHOLE_FUSE=1          Enable FUSE mounting (reduced isolation)
+  BLACKHOLE_ALLOW_BROAD_MOUNT=1
+                            Allow mounting /, your home, or /Users
+
+Project tools:
+  If ./.blackhole/Dockerfile exists, it is built from the base image and used
+  for this project. Run 'blackhole setup' in the project after editing it.
+EOF
+}
+
+require_host_tools() {
+    command -v colima >/dev/null 2>&1 || die "colima is required"
+    command -v docker >/dev/null 2>&1 || die "the Docker CLI is required"
+}
+
+docker_for() {
+    local profile="$1"
+    shift
+    DOCKER_HOST="unix://${COLIMA_DIR}/${profile}/docker.sock" docker "$@"
+}
+
+docker_vm() {
+    docker_for "$PROFILE" "$@"
+}
+
+ensure_vm() {
+    if ! colima -p "$PROFILE" status >/dev/null 2>&1; then
+        if ! colima list -j 2>/dev/null | grep -Fq "\"name\":\"${PROFILE}\""; then
+            die "Colima profile '${PROFILE}' does not exist; create it with: colima start --profile ${PROFILE} --vm-type vz --mount-type virtiofs --cpu 4 --memory 16 --disk 60"
+        fi
+        log "starting Colima profile '${PROFILE}'"
+        colima -p "$PROFILE" start
+    fi
+    docker_vm info >/dev/null 2>&1 \
+        || die "cannot connect to Colima profile '${PROFILE}'"
+}
+
+build_image() {
+    local version="${1:-latest}"
+    log "building ${DEFAULT_IMAGE} (Claude Code: ${version})"
+    docker_vm build \
+        --build-arg "CLAUDE_CODE_VERSION=${version}" \
+        -t "$DEFAULT_IMAGE" \
+        -f "${ROOT_DIR}/Dockerfile" \
+        "$ROOT_DIR"
+}
+
+project_dockerfile_path() {
+    printf '%s/.blackhole/Dockerfile' "$1"
+}
+
+project_image_tag() {
+    local dir="$1"
+    local dockerfile="$2"
+    local hash
+    hash="$( { printf '%s\n' "$dir"; cat "$dockerfile"; } \
+        | shasum -a 256 \
+        | awk '{ print substr($1, 1, 12) }' )"
+    printf 'blackhole-claude:project-%s' "$hash"
+}
+
+# Select the image for the current project. Setting BLACKHOLE_IMAGE explicitly
+# opts out, so a user can still force a completely custom image.
+resolve_project_image() {
+    IMAGE="$DEFAULT_IMAGE"
+    PROJECT_DOCKERFILE=""
+    [[ -z "${BLACKHOLE_IMAGE:-}" ]] || return 0
+
+    local dockerfile
+    dockerfile="$(project_dockerfile_path "$PROJECT_DIR")"
+    [[ -f "$dockerfile" ]] || return 0
+
+    PROJECT_DOCKERFILE="$dockerfile"
+    IMAGE="$(project_image_tag "$PROJECT_DIR" "$dockerfile")"
+}
+
+build_project_image() {
+    local dir="$1"
+    local dockerfile="$2"
+    local image="$3"
+    log "building project tools image ${image}"
+    docker_vm build \
+        --build-arg "BLACKHOLE_BASE=${DEFAULT_IMAGE}" \
+        -t "$image" \
+        -f "$dockerfile" \
+        "${dir}/.blackhole"
+}
+
+ensure_image() {
+    if ! docker_vm image inspect "$DEFAULT_IMAGE" >/dev/null 2>&1; then
+        build_image latest
+    fi
+    if [[ -n "${PROJECT_DOCKERFILE:-}" ]] \
+        && ! docker_vm image inspect "$IMAGE" >/dev/null 2>&1; then
+        build_project_image "$PROJECT_DIR" "$PROJECT_DOCKERFILE" "$IMAGE"
+    fi
+}
+
+validate_project() {
+    PROJECT_DIR="$(pwd -P)"
+    readonly PROJECT_DIR
+
+    if [[ ! -d "$PROJECT_DIR" ]]; then
+        die "the current directory no longer exists"
+    fi
+
+    if [[ "${BLACKHOLE_ALLOW_BROAD_MOUNT:-0}" != 1 ]]; then
+        case "$PROJECT_DIR" in
+            /|/Users|"$HOME")
+                die "refusing to mount the broad directory '${PROJECT_DIR}'; cd into a project first (override with BLACKHOLE_ALLOW_BROAD_MOUNT=1)"
+                ;;
+        esac
+    fi
+
+    colima -p "$PROFILE" ssh -- test -d "$PROJECT_DIR" </dev/null >/dev/null 2>&1 \
+        || die "'${PROJECT_DIR}' is not visible in Colima; configure this path as a Colima mount"
+
+    if fuse_enabled; then
+        colima -p "$PROFILE" ssh -- test -e /dev/fuse </dev/null >/dev/null 2>&1 \
+            || die "FUSE mode requires /dev/fuse in Colima profile '${PROFILE}'"
+    fi
+}
+
+# FUSE needs the device plus mount capability. AppArmor blocks the mount, and
+# no-new-privileges prevents fusermount3's setuid helper from gaining it.
+fuse_enabled() {
+    [[ "${BLACKHOLE_FUSE:-0}" == 1 ]] && return 0
+    [[ -f "${PROJECT_DIR}/.blackhole/fuse" ]]
+}
+
+run_container() {
+    local command=("$@")
+    local tty_args=(-i)
+
+    if [[ -t 0 && -t 1 ]]; then
+        tty_args=(-it)
+    fi
+
+    if clipboard_enabled; then
+        ensure_clipboard_watch
+    fi
+
+    local run_args=(
+        --init
+        --hostname blackhole
+        --pids-limit 512
+        --name "blackhole-${PROFILE}-$$"
+        --label dev.blackhole.session=1
+        --label "dev.blackhole.profile=${PROFILE}"
+        --label "dev.blackhole.project=${PROJECT_DIR}"
+        -e BLACKHOLE_ACTIVE=1
+        -e "BLACKHOLE_PROFILE=${PROFILE}"
+        -e "BLACKHOLE_PROJECT_PATH=${PROJECT_DIR}"
+        -e 'PS1=[BLACKHOLE] \w \$ '
+        -v "${PROJECT_DIR}:/workspace"
+        -v "${HOME_VOLUME}:/home/node"
+        -w /workspace
+    )
+
+    if fuse_enabled; then
+        run_args+=(--device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined)
+    else
+        run_args+=(--security-opt no-new-privileges)
+    fi
+
+    # Expose the mirrored clipboard images at the same absolute paths the
+    # host terminal uses, so pasted image references resolve inside the VM.
+    local host_tmp
+    host_tmp="$(clipboard_host_tmp)"
+    if clipboard_enabled && [[ -n "$host_tmp" ]] \
+        && [[ "$host_tmp" == /var/folders/* || "$host_tmp" == /private/var/folders/* ]]; then
+        run_args+=(-v "${CLIPBOARD_DIR}:${host_tmp}:ro")
+        if [[ "$host_tmp" == /var/folders/* ]]; then
+            run_args+=(-v "${CLIPBOARD_DIR}:/private${host_tmp}:ro")
+        fi
+    fi
+
+    local name
+    for name in TERM COLORTERM NO_COLOR ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+        if [[ -n "${!name:-}" ]]; then
+            run_args+=(-e "$name")
+        fi
+    done
+
+    if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
+        printf '\033[1;97;45m ⬤ BLACKHOLE \033[0m \033[1;35mColima VM isolated session · %s\033[0m\n' "$PROFILE" >&2
+        printf '\033[36m%s\033[0m \033[2m(only this directory is mounted)\033[0m\n' "$PROJECT_DIR" >&2
+        if fuse_enabled; then
+            printf '\033[1;33m⚠ FUSE enabled\033[0m \033[2m(SYS_ADMIN + AppArmor unconfined; reduced isolation)\033[0m\n' >&2
+        fi
+        printf '\n' >&2
+    else
+        log "isolated session on profile '${PROFILE}' starting for ${PROJECT_DIR}; look for [BLACKHOLE] in Claude's status line"
+        if fuse_enabled; then
+            log "FUSE mode enabled: reduced isolation"
+        fi
+    fi
+
+    # No host home, Docker socket, agent socket, or other project is mounted.
+    # The named volume stores only Claude's VM-side configuration and login.
+    docker_vm run --rm "${tty_args[@]}" \
+        "${run_args[@]}" \
+        "$IMAGE" \
+        "${command[@]}"
+}
+
+install_links() {
+    local prefix="${HOME}/.local/bin"
+    local force=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --prefix)
+                [[ $# -ge 2 ]] || die "--prefix requires a directory"
+                prefix="$2"
+                shift 2
+                ;;
+            --force)
+                force=1
+                shift
+                ;;
+            *) die "unknown install option: $1" ;;
+        esac
+    done
+
+    mkdir -p "$prefix"
+    local target link
+    for link in blackhole claude; do
+        target="${prefix}/${link}"
+        if [[ -e "$target" || -L "$target" ]]; then
+            if [[ "$force" == 1 ]]; then
+                rm -f "$target"
+            else
+                die "${target} already exists; use 'blackhole install --force' to replace it"
+            fi
+        fi
+        ln -s "${ROOT_DIR}/bin/blackhole" "$target"
+        log "installed ${target}"
+    done
+
+    if [[ ":${PATH}:" != *":${prefix}:"* ]]; then
+        log "add this to your shell profile: export PATH=\"${prefix}:\$PATH\""
+    fi
+}
+
+profile_records() {
+    # `colima list -j` emits one JSON object per line, not an array.
+    if command -v python3 >/dev/null 2>&1; then
+        colima list -j | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    item = json.loads(line)
+    print(item["name"], item["status"])
+'
+    else
+        colima list -j \
+            | sed -n 's/.*"name":"\([^"]*\)".*"status":"\([^"]*\)".*/\1 \2/p'
+    fi
+}
+
+# Run a registry query against every running Blackhole profile. The helper
+# container only reads the config volume; it never mounts a project.
+scan_registry() {
+    local command="$1"
+    shift
+    while read -r profile status; do
+        [[ "$status" == "Running" ]] || continue
+        local volume="blackhole-claude-home-${profile}"
+        docker_for "$profile" volume inspect "$volume" >/dev/null 2>&1 || continue
+        docker_for "$profile" image inspect "$IMAGE" >/dev/null 2>&1 || continue
+        local output
+        if ! output="$(docker_for "$profile" run --rm --network none \
+            -e "BLACKHOLE_PROFILE=${profile}" \
+            -v "${volume}:/home/node:ro" \
+            --entrypoint blackhole-registry \
+            "$IMAGE" "$command" "$@" 2>/dev/null)"; then
+            log "profile '${profile}' has no registry yet; run BLACKHOLE_COLIMA_PROFILE='${profile}' blackhole setup"
+            continue
+        fi
+        if [[ -n "$output" ]]; then
+            printf '%s\n' "$output"
+        fi
+    done < <(profile_records)
+}
+
+profile_meta_records() {
+    if command -v python3 >/dev/null 2>&1; then
+        colima list -j | python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    item = json.loads(line)
+    memory = int(int(item.get("memory", 0)) / (1024 ** 3))
+    print(item["name"], item["status"], memory)
+'
+    else
+        profile_records | awk '{print $1, $2, "?"}'
+    fi
+}
+
+running_pairs() {
+    while read -r profile status; do
+        [[ "$status" == "Running" ]] || continue
+        docker_for "$profile" ps --filter label=dev.blackhole.session=1 \
+            --format '{{.Label "dev.blackhole.profile"}}|{{.Label "dev.blackhole.project"}}' 2>/dev/null \
+            | while IFS='|' read -r pair_profile pair_path; do
+                [[ -n "$pair_profile" ]] && printf '%s\t%s\n' "$pair_profile" "$pair_path"
+            done
+    done < <(profile_records)
+}
+
+show_registry() {
+    local command="$1"
+    local header="$2"
+    local rows
+    rows="$(scan_registry "$command")"
+    if [[ -z "$rows" ]]; then
+        printf 'No %s recorded yet.\n' "$command"
+        return 0
+    fi
+
+    # A session counts as active only while a container with the same
+    # profile + project path is actually running. This also covers sessions
+    # created before the hooks existed, and sessions that crashed without
+    # firing SessionEnd.
+    if [[ "$command" == sessions ]]; then
+        local pairs
+        pairs="$(running_pairs)"
+        if [[ -n "$pairs" ]]; then
+            rows="$(awk -F '\t' '
+                BEGIN { OFS = "\t" }
+                NR == FNR { active[$1 SUBSEP $2] = 1; next }
+                {
+                    if ($6 == "unknown" && (($1 SUBSEP $3) in active)) $6 = "active"
+                    print
+                }
+            ' <(printf '%s\n' "$pairs") <(printf '%s\n' "$rows"))"
+        fi
+    fi
+
+    { printf '%s\n' "$header"; printf '%s\n' "$rows"; } \
+        | column -t -s $'\t'
+}
+
+show_profiles() {
+    printf 'PROFILE\tSTATUS\tMEMORY\tBLACKHOLE\tPROJECTS\tSESSIONS\tLAST USED\n'
+    local profile status memory
+    while read -r profile status memory; do
+        local initialized="-" projects="-" sessions="-" last="-"
+        if [[ "$status" == "Running" ]]; then
+            local volume="blackhole-claude-home-${profile}"
+            local registry=(docker_for "$profile" run --rm --network none
+                -v "${volume}:/home/node:ro"
+                --entrypoint blackhole-registry "$IMAGE")
+            if ! docker_for "$profile" volume inspect "$volume" >/dev/null 2>&1; then
+                initialized="no"
+            elif ! docker_for "$profile" image inspect "$IMAGE" >/dev/null 2>&1; then
+                initialized="no"
+            elif ! "${registry[@]}" projects >/dev/null 2>&1; then
+                initialized="stale"
+            else
+                initialized="yes"
+                projects="$("${registry[@]}" projects | wc -l | tr -d ' ')"
+                sessions="$("${registry[@]}" sessions | wc -l | tr -d ' ')"
+                last="$("${registry[@]}" projects \
+                    | awk -F '\t' 'BEGIN { m = "" } { if ($3 > m) m = $3 } END { print (m == "" ? "-" : m) }')"
+            fi
+        fi
+        if [[ "$memory" == "?" ]]; then
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$profile" "$status" "?" "$initialized" "$projects" "$sessions" "$last"
+        else
+            printf '%s\t%s\t%sGiB\t%s\t%s\t%s\t%s\n' \
+                "$profile" "$status" "$memory" "$initialized" "$projects" "$sessions" "$last"
+        fi
+    done < <(profile_meta_records) | column -t -s $'\t'
+}
+
+select_session_row() {
+    local prefix="$1"
+    local want_profile="$2"
+    local matches count
+
+    matches="$(scan_registry lookup "$prefix")"
+    if [[ -n "$want_profile" ]]; then
+        matches="$(printf '%s\n' "$matches" | awk -F '\t' -v p="$want_profile" '$2 == p')"
+    fi
+    [[ -n "$matches" ]] \
+        || die "no session matches '${prefix}'${want_profile:+ on profile '${want_profile}'}; start that profile first"
+    count="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
+    if [[ "$count" != 1 ]]; then
+        printf '%s\n' "$matches" | column -t -s $'\t' >&2
+        die "session prefix '${prefix}' is ambiguous; add --profile NAME"
+    fi
+
+    IFS=$'\t' read -r SELECTED_ID SELECTED_PROFILE SELECTED_PATH \
+        SELECTED_STARTED SELECTED_TRANSCRIPT <<< "$matches"
+}
+
+resume_session() {
+    local prefix=""
+    local want_profile=""
+    local dry_run=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a name"
+                want_profile="$2"
+                shift 2
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            *)
+                [[ -z "$prefix" ]] || die "usage: blackhole resume [--profile NAME] [--dry-run] <session-id-prefix>"
+                prefix="$1"
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$prefix" ]] || die "usage: blackhole resume [--profile NAME] [--dry-run] <session-id-prefix>"
+    require_host_tools
+
+    select_session_row "$prefix" "$want_profile"
+    [[ -n "$SELECTED_PATH" && -d "$SELECTED_PATH" ]] \
+        || die "recorded path '${SELECTED_PATH:-unknown}' does not exist on this host"
+
+    if [[ "$dry_run" == 1 ]]; then
+        printf 'would resume %s on profile %s in %s\n' \
+            "$SELECTED_ID" "$SELECTED_PROFILE" "$SELECTED_PATH"
+        return 0
+    fi
+
+    log "resuming ${SELECTED_ID} on profile '${SELECTED_PROFILE}' in ${SELECTED_PATH}"
+    cd "$SELECTED_PATH"
+    export BLACKHOLE_COLIMA_PROFILE="$SELECTED_PROFILE"
+    exec "${ROOT_DIR}/bin/blackhole" --resume "$SELECTED_ID"
+}
+
+export_session() {
+    local prefix=""
+    local want_profile=""
+    local output=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a name"
+                want_profile="$2"
+                shift 2
+                ;;
+            --output|-o)
+                [[ $# -ge 2 ]] || die "--output requires a file"
+                output="$2"
+                shift 2
+                ;;
+            --force)
+                # Kept for compatibility: exports now overwrite by default.
+                shift
+                ;;
+            *)
+                [[ -z "$prefix" ]] || die "usage: blackhole export [--profile NAME] [--output FILE] <session-id-prefix>"
+                prefix="$1"
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$prefix" ]] || die "usage: blackhole export [--profile NAME] [--output FILE] <session-id-prefix>"
+    require_host_tools
+
+    select_session_row "$prefix" "$want_profile"
+    [[ -n "$SELECTED_TRANSCRIPT" ]] \
+        || die "session ${SELECTED_ID} has no transcript path recorded"
+
+    local dest="${output:-${STATE_DIR}/sessions/${SELECTED_PROFILE}/${SELECTED_ID}.jsonl}"
+    local existed=0
+    [[ -e "$dest" ]] && existed=1
+    mkdir -p "$(dirname "$dest")"
+
+    local tmp="$(dirname "$dest")/.blackhole-export.$$"
+    if ! docker_for "$SELECTED_PROFILE" run --rm --network none \
+        -v "blackhole-claude-home-${SELECTED_PROFILE}:/home/node:ro" \
+        --entrypoint cat "$DEFAULT_IMAGE" "$SELECTED_TRANSCRIPT" > "$tmp"; then
+        rm -f "$tmp"
+        die "failed to export session transcript"
+    fi
+    if [[ ! -s "$tmp" ]]; then
+        rm -f "$tmp"
+        die "export produced an empty file"
+    fi
+    mv "$tmp" "$dest"
+    if [[ "$existed" == 1 ]]; then
+        log "overwrote $(wc -c < "$dest" | tr -d ' ') bytes at ${dest}"
+    else
+        log "wrote $(wc -c < "$dest" | tr -d ' ') bytes to ${dest}"
+    fi
+}
+
+signal_send() {
+    local file=""
+    local data=""
+    local message=""
+    local use_stdin=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --file|-f)
+                [[ $# -ge 2 ]] || die "--file requires a path"
+                file="$2"
+                shift 2
+                ;;
+            --data)
+                [[ $# -ge 2 ]] || die "--data requires a value"
+                data="$2"
+                shift 2
+                ;;
+            --message|-m)
+                [[ $# -ge 2 ]] || die "--message requires a value"
+                message="$2"
+                shift 2
+                ;;
+            --stdin)
+                use_stdin=1
+                shift
+                ;;
+            *)
+                die "usage: blackhole signal send --file PATH (--data JSON | --message TEXT | --stdin)"
+                ;;
+        esac
+    done
+    [[ -n "$file" ]] \
+        || die "usage: blackhole signal send --file PATH (--data JSON | --message TEXT | --stdin)"
+
+    if [[ "$use_stdin" == 1 ]]; then
+        data="$(cat)"
+    elif [[ -z "$data" && -z "$message" ]]; then
+        if [[ ! -t 0 ]]; then
+            data="$(cat)"
+        else
+            die "provide --data, --message, or --stdin"
+        fi
+    fi
+
+    mkdir -p "$(dirname "$file")"
+    local tmp="${file}.tmp.$$"
+    if [[ -n "$message" ]]; then
+        printf '%s\n' "$message" > "$tmp"
+    else
+        printf '%s' "$data" > "$tmp"
+    fi
+    mv "$tmp" "$file"
+    log "signal written to ${file}"
+}
+
+# Background loop used by `blackhole export-watch start`. It only copies the
+# transcript and atomically replaces the host export; no registry scan and no
+# agent involvement.
+run_export_watch() {
+    local profile=""
+    local session=""
+    local transcript=""
+    local output=""
+    local interval=60
+    local pidfile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile) profile="$2"; shift 2 ;;
+            --session) session="$2"; shift 2 ;;
+            --transcript) transcript="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            --interval) interval="$2"; shift 2 ;;
+            --pidfile) pidfile="$2"; shift 2 ;;
+            *) exit 2 ;;
+        esac
+    done
+    [[ -n "$profile" && -n "$session" && -n "$transcript" && -n "$output" && -n "$pidfile" ]] \
+        || exit 2
+
+    local state="${pidfile%.pid}.state"
+    local tmp="${output}.tmp.$$"
+    echo $$ > "$pidfile"
+    trap 'rm -f "$tmp" "$pidfile"; exit 0' TERM INT
+
+    printf '%s watching %s/%s every %ss\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$profile" "$session" "$interval"
+
+    while :; do
+        local started=$SECONDS
+        if docker_for "$profile" run --rm --network none \
+            -v "blackhole-claude-home-${profile}:/home/node:ro" \
+            --entrypoint cat "$DEFAULT_IMAGE" "$transcript" > "$tmp" 2>/dev/null \
+            && [[ -s "$tmp" ]]; then
+            mkdir -p "$(dirname "$output")"
+            local action="exported"
+            if [[ -f "$output" ]] && cmp -s "$tmp" "$output"; then
+                rm -f "$tmp"
+                action="unchanged"
+            else
+                mv "$tmp" "$output"
+            fi
+            local bytes
+            bytes="$(wc -c < "$output" | tr -d ' ')"
+            {
+                printf 'last_export=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+                printf 'last_bytes=%s\n' "$bytes"
+            } > "${state}.tmp" && mv "${state}.tmp" "$state"
+            printf '%s %s (%s bytes)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$action" "$bytes"
+        else
+            rm -f "$tmp"
+            printf '%s export failed\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        fi
+
+        local elapsed=$(( SECONDS - started ))
+        local sleep_for=$(( interval - elapsed ))
+        if (( sleep_for < 1 )); then
+            sleep_for=1
+        fi
+        sleep "$sleep_for"
+    done
+}
+
+export_watch_start() {
+    local want_profile=""
+    local interval=60
+    local prefix=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a name"
+                want_profile="$2"
+                shift 2
+                ;;
+            --interval)
+                [[ $# -ge 2 ]] || die "--interval requires seconds"
+                interval="$2"
+                shift 2
+                ;;
+            *)
+                [[ -z "$prefix" ]] || die "usage: blackhole export-watch start [--profile NAME] [--interval SECONDS] <session-prefix>"
+                prefix="$1"
+                shift
+                ;;
+        esac
+    done
+    [[ -n "$prefix" ]] \
+        || die "usage: blackhole export-watch start [--profile NAME] [--interval SECONDS] <session-prefix>"
+    [[ "$interval" =~ ^[0-9]+$ ]] && (( interval >= 5 )) \
+        || die "--interval must be an integer >= 5 seconds"
+    require_host_tools
+
+    select_session_row "$prefix" "$want_profile"
+    [[ -n "$SELECTED_TRANSCRIPT" ]] \
+        || die "session ${SELECTED_ID} has no transcript path recorded"
+
+    local base="${STATE_DIR}/export-watch/${SELECTED_PROFILE}/${SELECTED_ID}"
+    local pidfile="${base}.pid"
+    local logfile="${base}.log"
+    local output="${STATE_DIR}/sessions/${SELECTED_PROFILE}/${SELECTED_ID}.jsonl"
+    mkdir -p "$(dirname "$pidfile")" "$(dirname "$output")"
+
+    if [[ -f "$pidfile" ]]; then
+        local existing
+        existing="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+            die "already watching session ${SELECTED_ID} (pid ${existing})"
+        fi
+        rm -f "$pidfile"
+    fi
+
+    nohup "${ROOT_DIR}/bin/blackhole" __watch-session \
+        --profile "$SELECTED_PROFILE" \
+        --session "$SELECTED_ID" \
+        --transcript "$SELECTED_TRANSCRIPT" \
+        --output "$output" \
+        --interval "$interval" \
+        --pidfile "$pidfile" \
+        >> "$logfile" 2>&1 &
+    disown 2>/dev/null || true
+
+    local waited=0
+    while [[ ! -s "$pidfile" && "$waited" -lt 30 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -s "$pidfile" ]] || die "watcher failed to start; see ${logfile}"
+    local pid
+    pid="$(cat "$pidfile")"
+    kill -0 "$pid" 2>/dev/null || die "watcher exited immediately; see ${logfile}"
+
+    log "watching ${SELECTED_ID} on profile '${SELECTED_PROFILE}' every ${interval}s (pid ${pid})"
+    log "export: ${output}"
+    log "log:    ${logfile}"
+}
+
+export_watch_status() {
+    local rows=""
+    local file profile id pid state last
+    for file in "${STATE_DIR}"/export-watch/*/*.pid; do
+        [[ -f "$file" ]] || continue
+        profile="$(basename "$(dirname "$file")")"
+        id="$(basename "$file")"
+        id="${id%.pid}"
+        pid="$(cat "$file" 2>/dev/null || true)"
+        state="${file%.pid}.state"
+        last="$(sed -n 's/^last_export=//p' "$state" 2>/dev/null | tail -1)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            rows+="${profile}	${id}	${pid}	running	${last:--}"$'\n'
+        else
+            rows+="${profile}	${id}	${pid:--}	stale	${last:--}"$'\n'
+        fi
+    done
+
+    if [[ -z "$rows" ]]; then
+        printf 'No export watchers.\n'
+        return 0
+    fi
+    { printf 'PROFILE\tSESSION\tPID\tSTATUS\tLAST EXPORT\n'; printf '%s' "$rows"; } \
+        | column -t -s $'\t'
+}
+
+export_watch_stop() {
+    local prefix="${1:-}"
+    local file profile id pid command stopped=0
+    for file in "${STATE_DIR}"/export-watch/*/*.pid; do
+        [[ -f "$file" ]] || continue
+        id="$(basename "$file")"
+        id="${id%.pid}"
+        if [[ -n "$prefix" && "$id" != "$prefix"* ]]; then
+            continue
+        fi
+        profile="$(basename "$(dirname "$file")")"
+        pid="$(cat "$file" 2>/dev/null || true)"
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+            if [[ "$command" == *"__watch-session"* ]]; then
+                kill "$pid" 2>/dev/null || true
+                local waited=0
+                while kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt 25 ]]; do
+                    sleep 0.1
+                    waited=$((waited + 1))
+                done
+                kill -9 "$pid" 2>/dev/null || true
+                stopped=$((stopped + 1))
+                log "stopped watcher for ${profile}/${id}"
+            else
+                log "skipping pid ${pid}: not a Blackhole watcher"
+            fi
+        fi
+        rm -f "$file"
+    done
+    if [[ "$stopped" == 0 ]]; then
+        log "no matching export watcher"
+    fi
+}
+
+net_targets() {
+    local all="$1"
+    local want="$2"
+    if [[ "$all" == 1 ]]; then
+        profile_records | awk '{ print $1 }'
+    elif [[ -n "$want" ]]; then
+        printf '%s\n' "$want"
+    else
+        printf '%s\n' "$PROFILE"
+    fi
+}
+
+net_apply_script() {
+    cat <<'SCRIPT'
+set -e
+CHAIN=BLACKHOLE_AIRGAP
+GW="$(ip -4 route show default | awk '{print $3; exit}')"
+iptables -N "$CHAIN" 2>/dev/null || true
+iptables -F "$CHAIN"
+iptables -A "$CHAIN" -o lo -j RETURN
+iptables -A "$CHAIN" -d 127.0.0.0/8 -j RETURN
+if [ -n "$GW" ]; then iptables -A "$CHAIN" -d "$GW" -j RETURN; fi
+iptables -A "$CHAIN" -d 172.16.0.0/12 -j RETURN
+iptables -A "$CHAIN" -j DROP
+iptables -C OUTPUT -j "$CHAIN" 2>/dev/null || iptables -I OUTPUT 1 -j "$CHAIN"
+iptables -C FORWARD -j "$CHAIN" 2>/dev/null || iptables -I FORWARD 1 -j "$CHAIN"
+if iptables -S DOCKER-USER >/dev/null 2>&1; then
+    iptables -C DOCKER-USER -j "$CHAIN" 2>/dev/null || iptables -I DOCKER-USER 1 -j "$CHAIN"
+fi
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N "$CHAIN" 2>/dev/null || true
+    ip6tables -F "$CHAIN"
+    ip6tables -A "$CHAIN" -o lo -j RETURN
+    ip6tables -A "$CHAIN" -d fe80::/10 -j RETURN
+    ip6tables -A "$CHAIN" -j DROP
+    ip6tables -C OUTPUT -j "$CHAIN" 2>/dev/null || ip6tables -I OUTPUT 1 -j "$CHAIN"
+    ip6tables -C FORWARD -j "$CHAIN" 2>/dev/null || ip6tables -I FORWARD 1 -j "$CHAIN"
+fi
+echo airgap-applied
+SCRIPT
+}
+
+net_restore_script() {
+    cat <<'SCRIPT'
+set -e
+CHAIN=BLACKHOLE_AIRGAP
+for table in iptables ip6tables; do
+    command -v "$table" >/dev/null 2>&1 || continue
+    for chain in OUTPUT FORWARD DOCKER-USER; do
+        while "$table" -C "$chain" -j "$CHAIN" 2>/dev/null; do
+            "$table" -D "$chain" -j "$CHAIN"
+        done
+    done
+    "$table" -F "$CHAIN" 2>/dev/null || true
+    "$table" -X "$CHAIN" 2>/dev/null || true
+done
+echo airgap-removed
+SCRIPT
+}
+
+net_status_script() {
+    cat <<'SCRIPT'
+CHAIN=BLACKHOLE_AIRGAP
+if iptables -C OUTPUT -j "$CHAIN" 2>/dev/null; then
+    echo offline
+else
+    echo online
+fi
+SCRIPT
+}
+
+net_command() {
+    local action="$1"
+    shift
+    local all=0
+    local want=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                all=1
+                shift
+                ;;
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a name"
+                want="$2"
+                shift 2
+                ;;
+            *)
+                die "usage: blackhole net off|on|status [--all | --profile NAME]"
+                ;;
+        esac
+    done
+    require_host_tools
+
+    if [[ "$action" == status && "$all" == 0 && -z "$want" ]]; then
+        all=1
+    fi
+
+    local targets
+    targets="$(net_targets "$all" "$want")"
+    [[ -n "$targets" ]] || die "no matching Colima profile"
+
+    local profile running rows="" state
+    for profile in $targets; do
+        if colima -p "$profile" status >/dev/null 2>&1; then
+            running=1
+        else
+            running=0
+        fi
+
+        case "$action" in
+            off)
+                if [[ "$running" == 0 ]]; then
+                    log "skipping '${profile}': stopped"
+                    continue
+                fi
+                log "disabling network for '${profile}'"
+                if ! net_apply_script | colima ssh -p "$profile" -- sudo bash -s >/dev/null; then
+                    die "failed to disable network for '${profile}'"
+                fi
+                ;;
+            on)
+                if [[ "$running" == 0 ]]; then
+                    log "skipping '${profile}': stopped"
+                    continue
+                fi
+                log "restoring network for '${profile}'"
+                if ! net_restore_script | colima ssh -p "$profile" -- sudo bash -s >/dev/null; then
+                    die "failed to restore network for '${profile}'"
+                fi
+                ;;
+            status)
+                if [[ "$running" == 0 ]]; then
+                    rows+="${profile}"$'\t'"stopped"$'\n'
+                else
+                    state="$(net_status_script | colima ssh -p "$profile" -- sudo bash -s 2>/dev/null || echo unknown)"
+                    state="$(printf '%s\n' "$state" | tail -1)"
+                    rows+="${profile}"$'\t'"${state}"$'\n'
+                fi
+                ;;
+            *)
+                die "usage: blackhole net off|on|status [--all | --profile NAME]"
+                ;;
+        esac
+    done
+
+    if [[ "$action" == status ]]; then
+        { printf 'PROFILE\tNETWORK\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+    fi
+    return 0
+}
+
+net_watch_probe() {
+    local url="${BLACKHOLE_PROBE_URL:-https://www.google.com/generate_204}"
+    local timeout="${BLACKHOLE_PROBE_TIMEOUT:-15}"
+    local proxy="${BLACKHOLE_PROBE_PROXY:-}"
+    local require_tun="${BLACKHOLE_REQUIRE_TUN:-1}"
+    local args=(-sS --max-time "$timeout" -o /dev/null -w '%{http_code}')
+
+    # Shadowrocket uses a TUN interface. Requiring the route to the probe
+    # target to use utun catches the fail-open case where the proxy is gone but
+    # the host has fallen back to a direct internet connection.
+    if [[ "$require_tun" == 1 ]]; then
+        local iface
+        # Check the default route instead of resolving the probe hostname:
+        # this avoids a DNS lookup on every probe and detects Shadowrocket
+        # disappearing even when direct internet access still works.
+        iface="$(route -n get default 2>/dev/null | awk '/interface:/{ print $2; exit }')"
+        [[ "$iface" == utun* ]] || return 1
+    fi
+
+    if [[ -n "$proxy" ]]; then
+        args+=(--proxy "$proxy")
+    fi
+
+    # /usr/bin/curl is x86_64/Rosetta on this host; HTTPS through the TUN
+    # proxy times out there while the native arm64 slice works.
+    local curl_cmd=(curl)
+    if [[ "$(uname -m)" == "arm64" && -x /usr/bin/arch && -x /usr/bin/curl ]]; then
+        curl_cmd=(/usr/bin/arch -arm64 /usr/bin/curl)
+    fi
+
+    local code
+    code="$("${curl_cmd[@]}" "${args[@]}" "$url" 2>/dev/null)" || return 1
+    # Any normal HTTP response means the path through the proxy works. A 429
+    # still proves connectivity; 407/5xx/timeouts are treated as failures.
+    [[ "$code" =~ ^[23][0-9][0-9]$ || "$code" == 429 ]]
+}
+
+run_net_guard() {
+    local watcher_pid=""
+    local heartbeat=""
+    local max_age=5
+    local profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --watcher-pid) watcher_pid="$2"; shift 2 ;;
+            --heartbeat) heartbeat="$2"; shift 2 ;;
+            --max-age) max_age="$2"; shift 2 ;;
+            --profile) profile="$2"; shift 2 ;;
+            *) exit 2 ;;
+        esac
+    done
+    [[ -n "$watcher_pid" && -n "$heartbeat" ]] || exit 2
+
+    local scope=(--all)
+    if [[ -n "$profile" ]]; then
+        scope=(--profile "$profile")
+    fi
+
+    block_now() {
+        printf '%s net-guard: %s; blocking network\n' \
+            "$(date '+%Y-%m-%d %H:%M:%S')" "$1"
+        "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}" >/dev/null 2>&1 || true
+        exit 0
+    }
+
+    while kill -0 "$watcher_pid" 2>/dev/null; do
+        if [[ ! -f "$heartbeat" ]]; then
+            block_now "heartbeat missing"
+        fi
+        local mtime age
+        mtime="$(stat -f '%m' "$heartbeat" 2>/dev/null || echo 0)"
+        age=$(( $(date +%s) - mtime ))
+        if (( age > max_age )); then
+            block_now "heartbeat stale (${age}s)"
+        fi
+        sleep 1
+    done
+
+    block_now "watcher exited"
+}
+
+run_net_watch() {
+    local interval=1
+    local fail_after=2
+    local recover_after=2
+    local guard_max_age=0
+    local profile=""
+    local pidfile=""
+    local statefile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --fail-after) fail_after="$2"; shift 2 ;;
+            --recover-after) recover_after="$2"; shift 2 ;;
+            --guard-max-age) guard_max_age="$2"; shift 2 ;;
+            --profile) profile="$2"; shift 2 ;;
+            --pidfile) pidfile="$2"; shift 2 ;;
+            --statefile) statefile="$2"; shift 2 ;;
+            *) exit 2 ;;
+        esac
+    done
+    [[ -n "$pidfile" && -n "$statefile" ]] || exit 2
+    if (( guard_max_age <= 0 )); then
+        guard_max_age=$(( interval * 2 + ${BLACKHOLE_PROBE_TIMEOUT:-4} + 2 ))
+        (( guard_max_age < 8 )) && guard_max_age=8
+    fi
+
+    local scope=(--all)
+    if [[ -n "$profile" ]]; then
+        scope=(--profile "$profile")
+    fi
+
+    local heartbeat="${pidfile%.pid}.heartbeat"
+    echo $$ > "$pidfile"
+    touch "$heartbeat" 2>/dev/null || true
+    rm -f "${pidfile%.pid}.ready"
+
+    local guard_pid=""
+    start_guard() {
+        "${ROOT_DIR}/bin/blackhole" __net-guard \
+            --watcher-pid $$ \
+            --heartbeat "$heartbeat" \
+            --max-age "$guard_max_age" \
+            ${profile:+--profile "$profile"} \
+            >> "${pidfile%.pid}.log" 2>&1 &
+        guard_pid=$!
+    }
+
+    cleanup() {
+        if [[ -n "$guard_pid" ]]; then
+            kill "$guard_pid" 2>/dev/null || true
+        fi
+        "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}" >/dev/null 2>&1 || true
+        rm -f "$pidfile" "$heartbeat" "${pidfile%.pid}.ready"
+        exit 0
+    }
+    trap cleanup TERM INT
+
+    local fails=0 successes=0 desired=offline probe
+    printf '%s net-watch started (interval=%ss fail=%s recover=%s target=%s fail-close=1)\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$interval" "$fail_after" "$recover_after" \
+        "${profile:-all}"
+
+    # Fail-close: block first, then probe. Startup never exposes network.
+    "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}" >/dev/null 2>&1 || true
+    start_guard
+    touch "${pidfile%.pid}.ready"
+
+    while :; do
+        touch "$heartbeat" 2>/dev/null || true
+        if [[ -z "$guard_pid" ]] || ! kill -0 "$guard_pid" 2>/dev/null; then
+            start_guard
+        fi
+
+        if net_watch_probe; then
+            probe=up
+            successes=$((successes + 1))
+            fails=0
+            if (( successes >= recover_after )) && [[ "$desired" != online ]]; then
+                printf '%s probe=up; restoring network\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+                ( while :; do touch "$heartbeat" 2>/dev/null || true; sleep 1; done ) &
+                local ticker=$!
+                if "${ROOT_DIR}/bin/blackhole" net on "${scope[@]}"; then
+                    desired=online
+                    successes=0
+                fi
+                kill "$ticker" 2>/dev/null || true
+                wait "$ticker" 2>/dev/null || true
+                touch "$heartbeat"
+            fi
+        else
+            probe=down
+            fails=$((fails + 1))
+            successes=0
+            if (( fails >= fail_after )) && [[ "$desired" != offline ]]; then
+                printf '%s probe=down; blocking network\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+                ( while :; do touch "$heartbeat" 2>/dev/null || true; sleep 1; done ) &
+                local ticker=$!
+                if "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}"; then
+                    desired=offline
+                    fails=0
+                fi
+                kill "$ticker" 2>/dev/null || true
+                wait "$ticker" 2>/dev/null || true
+                touch "$heartbeat"
+            fi
+        fi
+
+        {
+            printf 'probe=%s\n' "$probe"
+            printf 'network=%s\n' "${desired:-unknown}"
+            printf 'fails=%s\n' "$fails"
+            printf 'successes=%s\n' "$successes"
+            printf 'updated=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+        } > "${statefile}.tmp" 2>/dev/null && mv "${statefile}.tmp" "$statefile" 2>/dev/null || true
+
+        sleep "$interval"
+    done
+}
+
+net_watch_start() {
+    local interval=1
+    local fail_after=2
+    local recover_after=2
+    local profile=""
+    local url=""
+    local proxy=""
+    local timeout="15"
+    local require_tun=1
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="$2"; shift 2 ;;
+            --fail-after) fail_after="$2"; shift 2 ;;
+            --recover-after) recover_after="$2"; shift 2 ;;
+            --profile) profile="$2"; shift 2 ;;
+            --url) url="$2"; shift 2 ;;
+            --proxy) proxy="$2"; shift 2 ;;
+            --timeout) timeout="$2"; shift 2 ;;
+            --no-require-tun) require_tun=0; shift ;;
+            --require-tun) require_tun=1; shift ;;
+            *)
+                die "usage: blackhole net-watch start [--profile NAME] [--interval SECONDS] [--fail-after N] [--recover-after N] [--url URL] [--proxy URL] [--timeout SECONDS] [--no-require-tun]"
+                ;;
+        esac
+    done
+    [[ "$interval" =~ ^[0-9]+$ ]] && (( interval >= 1 )) \
+        || die "--interval must be an integer >= 1"
+    [[ "$fail_after" =~ ^[1-9][0-9]*$ ]] || die "--fail-after must be a positive integer"
+    [[ "$recover_after" =~ ^[1-9][0-9]*$ ]] || die "--recover-after must be a positive integer"
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
+    require_host_tools
+    command -v curl >/dev/null 2>&1 || die "curl is required for net-watch"
+
+    if [[ -n "$url" ]]; then
+        export BLACKHOLE_PROBE_URL="$url"
+    fi
+    if [[ -n "$proxy" ]]; then
+        export BLACKHOLE_PROBE_PROXY="$proxy"
+    fi
+    export BLACKHOLE_PROBE_TIMEOUT="$timeout"
+    export BLACKHOLE_REQUIRE_TUN="$require_tun"
+
+    local guard_max_age=$(( interval * 2 + timeout + 2 ))
+    (( guard_max_age < 8 )) && guard_max_age=8
+
+    local dir="${STATE_DIR}/net-watch"
+    local pidfile="${dir}/net-watch.pid"
+    local statefile="${dir}/net-watch.state"
+    local readyfile="${dir}/net-watch.ready"
+    local logfile="${dir}/net-watch.log"
+    mkdir -p "$dir"
+
+    if [[ -f "$pidfile" ]]; then
+        local existing
+        existing="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+            die "net-watch is already running (pid ${existing})"
+        fi
+        rm -f "$pidfile"
+    fi
+
+    local scope=(--all)
+    if [[ -n "$profile" ]]; then
+        scope=(--profile "$profile")
+    fi
+    log "fail-close: blocking network before starting watcher"
+    "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}" >/dev/null 2>&1 || true
+
+    nohup "${ROOT_DIR}/bin/blackhole" __net-watch \
+        --interval "$interval" \
+        --fail-after "$fail_after" \
+        --recover-after "$recover_after" \
+        --guard-max-age "$guard_max_age" \
+        ${profile:+--profile "$profile"} \
+        --pidfile "$pidfile" \
+        --statefile "$statefile" \
+        >> "$logfile" 2>&1 &
+    disown 2>/dev/null || true
+
+    local waited=0
+    while [[ ! -s "$pidfile" && "$waited" -lt 30 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+    [[ -s "$pidfile" ]] || die "net-watch failed to start; see ${logfile}"
+    local pid
+    pid="$(cat "$pidfile")"
+    kill -0 "$pid" 2>/dev/null || die "net-watch exited immediately; see ${logfile}"
+
+    waited=0
+    while [[ ! -f "$readyfile" && "$waited" -lt 100 ]]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+
+    log "net-watch running (pid ${pid}), fail-close"
+    log "probe: ${BLACKHOLE_PROBE_URL:-https://www.google.com/generate_204} (require utun: ${require_tun})"
+    log "target: ${profile:-all running profiles}"
+    log "log: ${logfile}"
+}
+
+net_watch_status() {
+    local dir="${STATE_DIR}/net-watch"
+    local pidfile="${dir}/net-watch.pid"
+    local statefile="${dir}/net-watch.state"
+    local pid=""
+    if [[ -f "$pidfile" ]]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        printf 'WATCHER  running (pid %s)\n' "$pid"
+    else
+        printf 'WATCHER  stopped\n'
+    fi
+    if [[ -f "$statefile" ]]; then
+        local probe network updated
+        probe="$(awk -F '=' '/^probe=/{ print $2; exit }' "$statefile")"
+        network="$(awk -F '=' '/^network=/{ print $2; exit }' "$statefile")"
+        updated="$(awk -F '=' '/^updated=/{ sub(/^updated=/, ""); print; exit }' "$statefile")"
+        printf 'PROBE    %s\n' "${probe:-unknown}"
+        printf 'NETWORK  %s\n' "${network:-unknown}"
+        printf 'UPDATED  %s\n' "${updated:-unknown}"
+    fi
+    printf 'LOG      %s\n' "${dir}/net-watch.log"
+}
+
+net_watch_stop() {
+    local dir="${STATE_DIR}/net-watch"
+    local pidfile="${dir}/net-watch.pid"
+    local pid=""
+    if [[ -f "$pidfile" ]]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        local command
+        command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+        if [[ "$command" == *"__net-watch"* ]]; then
+            local scope=(--all)
+            if [[ "$command" =~ --profile[[:space:]]+([^[:space:]]+) ]]; then
+                scope=(--profile "${BASH_REMATCH[1]}")
+            fi
+            kill "$pid" 2>/dev/null || true
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [[ "$waited" -lt 100 ]]; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            kill -9 "$pid" 2>/dev/null || true
+            # Fail-close: stopping the watcher must not restore connectivity.
+            "${ROOT_DIR}/bin/blackhole" net off "${scope[@]}" >/dev/null 2>&1 || true
+            log "net-watch stopped; network left blocked (fail-close)"
+            log "use 'blackhole net on --all' to restore intentionally"
+        else
+            log "pid ${pid} is not a net-watch process; not killing"
+        fi
+    else
+        log "net-watch is not running"
+    fi
+    rm -f "$pidfile" "${pidfile%.pid}.heartbeat" "${pidfile%.pid}.ready"
+}
+
+net_ipv6_apply_script() {
+    cat <<'SCRIPT'
+set -e
+CONF=/etc/sysctl.d/99-blackhole-ipv6.conf
+IFACE="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i=="dev") { print $(i+1); exit }}')"
+{
+    echo "net.ipv6.conf.default.disable_ipv6 = 1"
+    if [ -n "$IFACE" ]; then
+        echo "net.ipv6.conf.${IFACE}.disable_ipv6 = 1"
+    fi
+} > "$CONF"
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+for d in /sys/class/net/*; do
+    n="${d##*/}"
+    [ "$n" = "lo" ] && continue
+    sysctl -w "net.ipv6.conf.${n}.disable_ipv6=1" >/dev/null 2>&1 || true
+done
+if command -v ip6tables >/dev/null 2>&1; then
+    CHAIN=BLACKHOLE_NO_IPV6
+    ip6tables -N "$CHAIN" 2>/dev/null || true
+    ip6tables -F "$CHAIN"
+    ip6tables -A "$CHAIN" -o lo -j RETURN
+    ip6tables -A "$CHAIN" -j DROP
+    ip6tables -C OUTPUT -j "$CHAIN" 2>/dev/null || ip6tables -I OUTPUT 1 -j "$CHAIN"
+    ip6tables -C FORWARD -j "$CHAIN" 2>/dev/null || ip6tables -I FORWARD 1 -j "$CHAIN"
+    if ip6tables -S DOCKER-USER >/dev/null 2>&1; then
+        ip6tables -C DOCKER-USER -j "$CHAIN" 2>/dev/null || ip6tables -I DOCKER-USER 1 -j "$CHAIN"
+    fi
+fi
+echo ipv6-disabled
+SCRIPT
+}
+
+net_ipv6_restore_script() {
+    cat <<'SCRIPT'
+set -e
+rm -f /etc/sysctl.d/99-blackhole-ipv6.conf
+sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1 || true
+for d in /sys/class/net/*; do
+    n="${d##*/}"
+    [ "$n" = "lo" ] && continue
+    sysctl -w "net.ipv6.conf.${n}.disable_ipv6=0" >/dev/null 2>&1 || true
+done
+if command -v ip6tables >/dev/null 2>&1; then
+    CHAIN=BLACKHOLE_NO_IPV6
+    for chain in OUTPUT FORWARD DOCKER-USER; do
+        while ip6tables -C "$chain" -j "$CHAIN" 2>/dev/null; do
+            ip6tables -D "$chain" -j "$CHAIN"
+        done
+    done
+    ip6tables -F "$CHAIN" 2>/dev/null || true
+    ip6tables -X "$CHAIN" 2>/dev/null || true
+fi
+echo ipv6-enabled
+SCRIPT
+}
+
+net_ipv6_status_script() {
+    cat <<'SCRIPT'
+IFACE="$(ip -4 route show default | awk '{for (i=1; i<=NF; i++) if ($i=="dev") { print $(i+1); exit }}')"
+VAL=0
+if [ -n "$IFACE" ]; then
+    VAL="$(cat "/proc/sys/net/ipv6/conf/${IFACE}/disable_ipv6" 2>/dev/null || echo 0)"
+fi
+GLOBAL="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/{c++} END{print c+0}')"
+if [ "$VAL" = "1" ] && [ "$GLOBAL" = "0" ]; then
+    echo disabled
+else
+    echo enabled
+fi
+SCRIPT
+}
+
+net_ipv6_command() {
+    local action="$1"
+    shift
+    local all=0
+    local want=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all) all=1; shift ;;
+            --profile)
+                [[ $# -ge 2 ]] || die "--profile requires a name"
+                want="$2"
+                shift 2
+                ;;
+            *) die "usage: blackhole net ipv6 off|on|status [--all | --profile NAME]" ;;
+        esac
+    done
+    require_host_tools
+    if [[ "$action" == status && "$all" == 0 && -z "$want" ]]; then
+        all=1
+    fi
+
+    local targets
+    targets="$(net_targets "$all" "$want")"
+    [[ -n "$targets" ]] || die "no matching Colima profile"
+
+    local profile running rows="" state
+    for profile in $targets; do
+        if colima -p "$profile" status >/dev/null 2>&1; then
+            running=1
+        else
+            running=0
+        fi
+
+        case "$action" in
+            off)
+                [[ "$running" == 1 ]] || { log "skipping '${profile}': stopped"; continue; }
+                log "disabling IPv6 for '${profile}'"
+                if ! net_ipv6_apply_script | colima ssh -p "$profile" -- sudo bash -s >/dev/null; then
+                    die "failed to disable IPv6 for '${profile}'"
+                fi
+                ;;
+            on)
+                [[ "$running" == 1 ]] || { log "skipping '${profile}': stopped"; continue; }
+                log "enabling IPv6 for '${profile}'"
+                if ! net_ipv6_restore_script | colima ssh -p "$profile" -- sudo bash -s >/dev/null; then
+                    die "failed to enable IPv6 for '${profile}'"
+                fi
+                ;;
+            status)
+                if [[ "$running" == 0 ]]; then
+                    rows+="${profile}"$'\t'"stopped"$'\n'
+                else
+                    state="$(net_ipv6_status_script | colima ssh -p "$profile" -- sudo bash -s 2>/dev/null || echo unknown)"
+                    state="$(printf '%s\n' "$state" | tail -1)"
+                    rows+="${profile}"$'\t'"${state}"$'\n'
+                fi
+                ;;
+            *) die "usage: blackhole net ipv6 off|on|status [--all | --profile NAME]" ;;
+        esac
+    done
+
+    if [[ "$action" == status ]]; then
+        { printf 'PROFILE\tIPV6\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+    fi
+    return 0
+}
+
+clipboard_host_tmp() {
+    local dir="${TMPDIR:-}"
+    if [[ -z "$dir" ]]; then
+        dir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+    fi
+    dir="${dir%/}"
+    printf '%s' "$dir"
+}
+
+run_clipboard_watch() {
+    local source=""
+    local dest=""
+    local pidfile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --source) source="$2"; shift 2 ;;
+            --dest) dest="$2"; shift 2 ;;
+            --pidfile) pidfile="$2"; shift 2 ;;
+            *) exit 2 ;;
+        esac
+    done
+    [[ -n "$source" && -n "$dest" && -n "$pidfile" ]] || exit 2
+    mkdir -p "$dest"
+    echo $$ > "$pidfile"
+    trap 'rm -f "$pidfile"; exit 0' TERM INT
+    set +e
+
+    while :; do
+        if [[ -d "$source" ]]; then
+            find "$source" -maxdepth 2 -type f -mmin -240 \
+                \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' \
+                -o -iname '*.gif' -o -iname '*.webp' -o -iname '*.heic' \
+                -o -iname '*.tiff' -o -iname '*.bmp' \) -print0 2>/dev/null \
+            | while IFS= read -r -d '' file; do
+                local base tmp
+                base="${file##*/}"
+                if [[ -f "$dest/$base" ]]; then
+                    continue
+                fi
+                tmp="$dest/.$base.$$"
+                if cp -p "$file" "$tmp" 2>/dev/null; then
+                    mv "$tmp" "$dest/$base"
+                    printf '%s copied clipboard image %s\n' \
+                        "$(date '+%Y-%m-%d %H:%M:%S')" "$base"
+                else
+                    rm -f "$tmp"
+                fi
+            done
+        fi
+        find "$dest" -type f -mmin +10080 -delete 2>/dev/null || true
+        sleep 0.5
+    done
+}
+
+clipboard_enabled() {
+    [[ "${BLACKHOLE_CLIPBOARD:-1}" != 0 ]] || return 1
+    [[ ! -f "$CLIPBOARD_DISABLED" ]]
+}
+
+ensure_clipboard_watch() {
+    clipboard_enabled || return 0
+    local source
+    source="$(clipboard_host_tmp)"
+    [[ -n "$source" && -d "$source" ]] || return 0
+    mkdir -p "$CLIPBOARD_DIR" "${STATE_DIR}/clipboard-watch"
+
+    local pidfile="${STATE_DIR}/clipboard-watch/clipboard.pid"
+    local logfile="${STATE_DIR}/clipboard-watch/clipboard.log"
+    if [[ -f "$pidfile" ]]; then
+        local existing
+        existing="$(cat "$pidfile" 2>/dev/null || true)"
+        if [[ -n "$existing" ]] && kill -0 "$existing" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$pidfile"
+    fi
+
+    nohup "${ROOT_DIR}/bin/blackhole" __clipboard-watch \
+        --source "$source" \
+        --dest "$CLIPBOARD_DIR" \
+        --pidfile "$pidfile" \
+        >> "$logfile" 2>&1 &
+    disown 2>/dev/null || true
+    printf '%s\n' "$source" > "${pidfile%.pid}.source"
+    return 0
+}
+
+clipboard_watch_status() {
+    if [[ -f "$CLIPBOARD_DISABLED" ]]; then
+        printf 'STATE    disabled\n'
+    else
+        printf 'STATE    enabled\n'
+    fi
+    local pidfile="${STATE_DIR}/clipboard-watch/clipboard.pid"
+    local sourcefile="${STATE_DIR}/clipboard-watch/clipboard.source"
+    local pid=""
+    if [[ -f "$pidfile" ]]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        printf 'WATCHER  running (pid %s)\n' "$pid"
+    else
+        printf 'WATCHER  stopped\n'
+    fi
+    printf 'SOURCE   %s\n' "$(cat "$sourcefile" 2>/dev/null || printf '-')"
+    printf 'MIRROR   %s\n' "$CLIPBOARD_DIR"
+    printf 'FILES    %s\n' "$(find "$CLIPBOARD_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')"
+}
+
+clipboard_watch_stop() {
+    local pidfile="${STATE_DIR}/clipboard-watch/clipboard.pid"
+    local pid=""
+    if [[ -f "$pidfile" ]]; then
+        pid="$(cat "$pidfile" 2>/dev/null || true)"
+    fi
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        log "clipboard mirror stopped"
+    else
+        log "clipboard mirror is not running"
+    fi
+    rm -f "$pidfile"
+}
+
+status() {
+    require_host_tools
+    printf 'Colima profile: %s\n' "$PROFILE"
+
+    local launcher
+    launcher="$(command -v claude 2>/dev/null || true)"
+    if [[ -n "$launcher" && -L "$launcher" \
+        && "$(readlink "$launcher")" == "${ROOT_DIR}/bin/blackhole" ]]; then
+        printf 'Claude launcher: protected (%s)\n' "$launcher"
+    else
+        printf 'Claude launcher: NOT PROTECTED%s\n' "${launcher:+ (${launcher})}"
+        printf "                 run 'blackhole install' and restart your shell\n"
+    fi
+
+    if colima -p "$PROFILE" status >/dev/null 2>&1; then
+        printf 'Colima:         running\n'
+    else
+        printf 'Colima:         stopped\n'
+        return 0
+    fi
+    printf 'Image:          %s\n' "$IMAGE"
+    if docker_vm image inspect "$IMAGE" >/dev/null 2>&1; then
+        printf 'Image status:   built\n'
+        # Probe without mounting the shared config volume: a status check must
+        # never touch the Claude state of a running session. The image root is
+        # read-only and networking is disabled.
+        docker_vm run --rm --network none --read-only --tmpfs /tmp \
+            --entrypoint claude \
+            "$IMAGE" --version 2>/dev/null \
+            | awk '{print "Claude Code:    " $0}'
+        printf 'Image ID:       %s\n' \
+            "$(docker_vm image inspect --format '{{.Id}}' "$IMAGE")"
+    else
+        printf 'Image status:   not built\n'
+    fi
+    printf 'Config volume:  %s\n' "$HOME_VOLUME"
+
+    local project_dockerfile
+    project_dockerfile="$(project_dockerfile_path "$(pwd -P)")"
+    if [[ -z "${BLACKHOLE_IMAGE:-}" && -f "$project_dockerfile" ]]; then
+        local project_image
+        project_image="$(project_image_tag "$(pwd -P)" "$project_dockerfile")"
+        if docker_vm image inspect "$project_image" >/dev/null 2>&1; then
+            printf 'Project image:  %s (built)\n' "$project_image"
+        else
+            printf 'Project image:  %s (not built)\n' "$project_image"
+        fi
+    fi
+
+    if [[ "${BLACKHOLE_FUSE:-0}" == 1 || -f "$(pwd -P)/.blackhole/fuse" ]]; then
+        printf 'FUSE:           enabled (reduced isolation)\n'
+    fi
+
+    local sessions
+    sessions="$(docker_vm ps \
+        --filter "label=dev.blackhole.session=1" \
+        --filter "label=dev.blackhole.profile=${PROFILE}" \
+        --format '{{.Names}}|{{.Label "dev.blackhole.project"}}')"
+    if [[ -n "$sessions" ]]; then
+        printf 'Active sessions:\n'
+        while IFS='|' read -r name project; do
+            printf '  %s  %s\n' "$name" "$project"
+        done <<< "$sessions"
+    else
+        printf 'Active sessions: none\n'
+    fi
+}
+
+main() {
+    resolve_profile
+    local command="${1:-run}"
+    case "$command" in
+        help|-h)
+            usage
+            ;;
+        setup|update)
+            shift
+            local version=latest
+            if [[ "${1:-}" == --claude-version ]]; then
+                [[ $# -ge 2 ]] || die "--claude-version requires a version"
+                version="$2"
+                shift 2
+            fi
+            [[ $# -eq 0 ]] || die "unknown option: $1"
+            require_host_tools
+            ensure_vm
+            build_image "$version"
+            local project_dir
+            project_dir="$(pwd -P)"
+            if [[ -z "${BLACKHOLE_IMAGE:-}" ]]; then
+                local project_dockerfile
+                project_dockerfile="$(project_dockerfile_path "$project_dir")"
+                if [[ -f "$project_dockerfile" ]]; then
+                    build_project_image "$project_dir" "$project_dockerfile" \
+                        "$(project_image_tag "$project_dir" "$project_dockerfile")"
+                fi
+            fi
+            log "ready; run 'claude' from a project directory"
+            ;;
+        install)
+            shift
+            install_links "$@"
+            ;;
+        bind)
+            shift
+            profile_bind "$@"
+            ;;
+        unbind)
+            shift
+            profile_unbind "$@"
+            ;;
+        bindings)
+            profile_bindings
+            ;;
+        status)
+            status
+            ;;
+        sessions)
+            require_host_tools
+            show_registry sessions $'PROFILE\tSESSION\tPATH\tSTARTED\tLAST ACTIVE\tSTATUS'
+            ;;
+        projects)
+            require_host_tools
+            show_registry projects $'PROFILE\tPATH\tLAST USED\tSESSIONS'
+            ;;
+        profiles)
+            require_host_tools
+            show_profiles
+            ;;
+        resume)
+            shift
+            resume_session "$@"
+            ;;
+        export)
+            shift
+            export_session "$@"
+            ;;
+        signal)
+            shift
+            [[ "${1:-}" == send ]] \
+                || die "usage: blackhole signal send --file PATH (--data JSON | --message TEXT | --stdin)"
+            shift
+            signal_send "$@"
+            ;;
+        net)
+            shift
+            [[ $# -ge 1 ]] || die "usage: blackhole net off|on|status|ipv6 ..."
+            if [[ "$1" == "ipv6" ]]; then
+                shift
+                [[ $# -ge 1 ]] || die "usage: blackhole net ipv6 off|on|status [--all | --profile NAME]"
+                local ipv6_action="$1"
+                shift
+                net_ipv6_command "$ipv6_action" "$@"
+            else
+                local net_action="$1"
+                shift
+                net_command "$net_action" "$@"
+            fi
+            ;;
+        clipboard)
+            shift
+            case "${1:-status}" in
+                start)
+                    rm -f "$CLIPBOARD_DISABLED"
+                    ensure_clipboard_watch
+                    ;;
+                stop) clipboard_watch_stop ;;
+                disable)
+                    clipboard_watch_stop
+                    touch "$CLIPBOARD_DISABLED"
+                    log "clipboard mirror disabled"
+                    ;;
+                enable)
+                    rm -f "$CLIPBOARD_DISABLED"
+                    ensure_clipboard_watch
+                    ;;
+                status) clipboard_watch_status ;;
+                *) die "usage: blackhole clipboard start|status|stop|disable|enable" ;;
+            esac
+            ;;
+        __clipboard-watch)
+            shift
+            run_clipboard_watch "$@"
+            ;;
+        net-watch)
+            shift
+            case "${1:-}" in
+                start)
+                    shift
+                    net_watch_start "$@"
+                    ;;
+                status)
+                    net_watch_status
+                    ;;
+                stop)
+                    net_watch_stop
+                    ;;
+                *)
+                    die "usage: blackhole net-watch start|status|stop"
+                    ;;
+            esac
+            ;;
+        __net-watch)
+            shift
+            run_net_watch "$@"
+            ;;
+        __net-guard)
+            shift
+            run_net_guard "$@"
+            ;;
+        export-watch)
+            shift
+            case "${1:-status}" in
+                start)
+                    shift
+                    export_watch_start "$@"
+                    ;;
+                status)
+                    export_watch_status
+                    ;;
+                stop)
+                    shift
+                    export_watch_stop "$@"
+                    ;;
+                *)
+                    die "usage: blackhole export-watch start|status|stop"
+                    ;;
+            esac
+            ;;
+        __watch-session)
+            shift
+            run_export_watch "$@"
+            ;;
+        shell)
+            shift
+            [[ $# -eq 0 ]] || die "shell does not accept arguments"
+            require_host_tools
+            ensure_vm
+            validate_project
+            resolve_project_image
+            ensure_image
+            run_container bash --rcfile /usr/local/etc/blackhole-bashrc
+            ;;
+        run)
+            # With no arguments, `command` defaults to "run" but there is no
+            # actual argument to consume. An unconditional shift exits under
+            # `set -e`, making a plain `claude` fail silently.
+            if [[ $# -gt 0 ]]; then
+                shift
+            fi
+            require_host_tools
+            ensure_vm
+            validate_project
+            resolve_project_image
+            ensure_image
+            run_container claude "$@"
+            ;;
+        *)
+            require_host_tools
+            ensure_vm
+            validate_project
+            resolve_project_image
+            ensure_image
+            run_container claude "$@"
+            ;;
+    esac
+}
+
+main "$@"
