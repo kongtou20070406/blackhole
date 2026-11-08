@@ -8,7 +8,7 @@
 
 直接在 macOS 宿主机上运行 `claude` 会同时暴露两件事：一是宿主机文件系统（`~/.ssh`、云厂商凭据、Docker socket 及其他代码仓库），二是**宿主机环境指纹**（macOS 硬件标识、系统地区与语言设置、宿主机用户名、环境变量，以及代理闪退时的真实网络出口）。
 
-Blackhole 把宿主机上的 `claude` 替换成一个轻量启动器。当你在项目目录下敲 `claude` 时，它会在 Colima 虚拟机内拉起一个一次性 Linux 容器，让 Claude Code 只能看到标准化的 Linux 容器环境与受控的网络出口：
+Blackhole 用一个纯 Bash 启动器脚本（`~/.local/bin/claude -> bin/blackhole`）接管宿主机上的 `claude` 命令。**宿主机本机根本不需要安装 Claude Code** —— 真正的 `@anthropic-ai/claude-code` 只安装在 Colima 虚拟机的 Docker 镜像内部。当你在项目目录下敲 `claude` 时，宿主机软链接会拦截命令并在 Colima 虚拟机内拉起一个一次性 Linux 容器，让 Claude Code 只能看到标准化的 Linux 容器环境与受控的网络出口：
 
 - **仅挂载当前目录**：通过 Colima 的 `virtiofs` 只把 `$PWD` 挂载到容器内 `/workspace`，绝不挂载宿主机 `$HOME`、SSH Agent 或 Docker socket。
 - **宿主机指纹隔离**：运行在干净的 Debian 容器内，固定 `--hostname blackhole`，自动将 `node` 用户 UID/GID 对齐到 `/workspace` 属主，并严格限制透传的环境变量白名单（仅 `TERM`、`COLORTERM`、`NO_COLOR` 及可选 API Key），屏蔽宿主机系统特征、用户名与环境变量。
@@ -85,7 +85,7 @@ blackhole shell
 
 ## 安装
 
-依赖 **macOS**、**[Colima](https://github.com/abiosoft/colima)** 和 **Docker CLI**（`brew install colima docker`）。启动 Colima 时建议开启 Apple Virtualization（`vz`）和 `virtiofs` 以获得接近原生的文件读写性能：
+依赖 **macOS**、**[Colima](https://github.com/abiosoft/colima)** 和 **Docker CLI**（`brew install colima docker`）。**宿主机无需安装 Claude Code 或 Node.js**（`blackhole setup` 会直接在虚拟机镜像内安装 `@anthropic-ai/claude-code`）。启动 Colima 时建议开启 Apple Virtualization（`vz`）和 `virtiofs` 以获得接近原生的文件读写性能：
 
 ```bash
 colima start --vm-type vz --mount-type virtiofs --cpu 4 --memory 8 --disk 60

@@ -8,7 +8,7 @@ Run [Claude Code](https://docs.anthropic.com/en/docs/claude-code) inside an isol
 
 Running `claude` directly on a macOS host exposes two things at once: your local filesystem (`~/.ssh`, cloud credentials, Docker sockets, sibling repositories) and your **host environment fingerprint** (macOS hardware identifiers, locale/timezone settings, host username, environment variables, and direct network interfaces if a proxy drops).
 
-Blackhole replaces the host `claude` command with a thin launcher. When you run `claude` in a project directory, Blackhole starts an ephemeral Linux container inside your Colima VM so Claude Code only ever sees a generic Linux environment and controlled network egress:
+Blackhole replaces the host `claude` command with a pure Bash launcher (`~/.local/bin/claude -> bin/blackhole`). **Claude Code is never installed on your macOS host** — the actual `@anthropic-ai/claude-code` package lives exclusively inside the Colima VM's Docker image. When you type `claude` in a project directory, the host symlink intercepts the command and starts an ephemeral Linux container inside your Colima VM so Claude Code only ever sees a generic Linux environment and controlled network egress:
 
 - **Directory-scoped mount**: Only `$PWD` is mounted at `/workspace` over Colima's `virtiofs`. Host `$HOME`, SSH agents, and Docker sockets are never mounted.
 - **Host fingerprint isolation**: Runs inside a clean Debian container with `--hostname blackhole`, a remapped `node` user matching `/workspace` UID/GID, and a strict environment variable allowlist (`TERM`, `COLORTERM`, `NO_COLOR`, and optional API keys) — hiding macOS host telemetry, usernames, and environment variables.
@@ -85,7 +85,7 @@ blackhole shell
 
 ## Install
 
-Requires **macOS**, **[Colima](https://github.com/abiosoft/colima)**, and the **Docker CLI** (`brew install colima docker`). Start your Colima VM with Apple Virtualization (`vz`) and `virtiofs` for near-native filesystem performance:
+Requires **macOS**, **[Colima](https://github.com/abiosoft/colima)**, and the **Docker CLI** (`brew install colima docker`). You do **not** need to install Claude Code or Node.js on the host (`blackhole setup` installs `@anthropic-ai/claude-code` inside the VM image). Start your Colima VM with Apple Virtualization (`vz`) and `virtiofs` for near-native filesystem performance:
 
 ```bash
 colima start --vm-type vz --mount-type virtiofs --cpu 4 --memory 8 --disk 60
