@@ -18,7 +18,7 @@ Blackhole 用一个纯 Bash 启动器脚本（`~/.local/bin/claude -> bin/blackh
 
 ## 使用
 
-> **推荐用法：交给 Agent 驾驭。** 你不需要死记硬背下面的所有子命令。最省心的用法是直接让宿主机上的 Coding Agent 接管这个仓库，由它代你完成环境初始化、Colima profile 目录绑定、编写项目的 `.blackhole/Dockerfile`、开启 `net-watch` 断网保护以及导出或迁移历史会话。
+> **推荐用法：交给 Agent 驾驭。** 你不需要死记硬背下面的所有子命令。直接让宿主机上的 Coding Agent 读取本仓库（内置了 [`AGENTS.md`](AGENTS.md) 操作手册），由它代你完成环境初始化、Colima profile 目录绑定、编写项目的 `.blackhole/Dockerfile`、开启 `net-watch` 断网保护以及导出或迁移历史会话。
 
 在 `$HOME` 下的任意项目目录中直接运行 `claude`：
 

@@ -18,7 +18,7 @@ Blackhole replaces the host `claude` command with a pure Bash launcher (`~/.loca
 
 ## Usage
 
-> **Tip: Let an agent drive it.** You do not need to memorize every subcommand below. The recommended workflow is to point your host coding agent at this repository and let it handle setup, Colima profile binding, `.blackhole/Dockerfile` tool customization, `net-watch` protection, and session exports or migrations on your behalf.
+> **Tip: Let an agent drive it.** You do not need to memorize every subcommand below. Point your host coding agent at this repository (see [`AGENTS.md`](AGENTS.md)) and let it handle setup, Colima profile binding, `.blackhole/Dockerfile` tool customization, `net-watch` protection, and session exports or migrations on your behalf.
 
 Run `claude` inside any project directory under `$HOME`:
 
