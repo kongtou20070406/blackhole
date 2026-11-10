@@ -63,7 +63,7 @@ BLACKHOLE_COLIMA_PROFILE=<profile> ./bin/blackhole setup
 ./bin/blackhole bind <profile> /path/to/project
 ```
 
-Subdirectories inherit the binding automatically. Precedence is: `BLACKHOLE_COLIMA_PROFILE` env var > nearest ancestor directory binding > `default`.
+Subdirectories inherit the binding automatically. Precedence is: `BLACKHOLE_PROFILE` > `BLACKHOLE_COLIMA_PROFILE` > nearest ancestor directory binding > `default`.
 
 ### 4. Adding Per-Project Linux Tools (`.blackhole/Dockerfile`)
 
