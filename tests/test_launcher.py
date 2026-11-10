@@ -26,7 +26,10 @@ elif tool == 'wslpath':
     print(args[-1])
 elif tool == 'powershell.exe':
     if os.environ.get('CLIPBOARD_EMPTY'): sys.exit(1)
-    Path(args[args.index('-OutputPath') + 1]).write_bytes(b'\x89PNG\r\n\x1a\nfixture')
+    if os.environ.get('CLIPBOARD_RACE'):
+        Path(os.environ['PROJECT'], 'capture.png').symlink_to(os.environ['CLIPBOARD_RACE'], target_is_directory=True)
+    import base64
+    print(base64.b64encode(b'\x89PNG\r\n\x1a\nfixture').decode())
 elif tool == 'colima':
     if args == ['list', '-j']:
         print('{"name":"default","status":"Running","memory":8589934592}')
@@ -34,7 +37,11 @@ elif tool == 'docker':
     if any(a.startswith('label!=') for a in args): sys.exit('unsupported container label filter')
     if args[0] == 'info':
         if os.environ.get('DAEMON_DOWN'): sys.exit(1)
-        print(os.environ.get('ENGINE_OS', 'linux'))
+        if args[-1] == '{{json .SecurityOptions}}':
+            if os.environ.get('SECURITY_INFO_FAIL'): sys.exit(1)
+            print(os.environ.get('ENGINE_SECURITY', '[]'))
+        else:
+            print(os.environ.get('ENGINE_OS', 'linux'))
     elif args[:2] == ['volume', 'ls']:
         if os.environ.get('DAEMON_DOWN'): sys.exit(1)
         print(os.environ.get('VOLUMES', ''))
@@ -135,6 +142,22 @@ class LauncherTests(unittest.TestCase):
     def test_daemon_or_engine_errors_never_start_a_container(self):
         self.assertIn('socket permissions', self.run_cli('shell', ok=False, DAEMON_DOWN='1').stderr)
         self.assertIn('Linux Docker engine', self.run_cli('shell', ok=False, ENGINE_OS='windows').stderr)
+        self.assertEqual(self.launched(), [])
+
+    def test_rootless_sessions_fail_before_builds_networks_or_containers(self):
+        for args in [('shell',), ('run',), ('-p', 'hello')]:
+            result = self.run_cli(*args, ok=False, ENGINE_SECURITY='["name=rootless"]',
+                                  NO_IMAGE='1', BLACKHOLE_PROXY='http://host:7890')
+            self.assertIn('rootless Docker is not supported', result.stderr)
+        self.assertFalse(any(args[0] in ('build', 'create', 'run', 'network')
+                             for _, args, _ in self.calls()))
+
+    def test_security_inspection_failure_does_not_start_a_session(self):
+        self.run_cli('shell', ok=False, SECURITY_INFO_FAIL='1')
+        self.assertEqual(self.launched(), [])
+
+    def test_rootless_status_remains_available_without_launching_a_session(self):
+        self.assertIn('shared engine', self.run_cli('status', ENGINE_SECURITY='["name=rootless"]').stdout)
         self.assertEqual(self.launched(), [])
 
     def test_broad_mounts_are_rejected_with_an_explicit_opt_in(self):
@@ -258,6 +281,14 @@ class LauncherTests(unittest.TestCase):
         self.run_cli('clipboard', 'paste', 'existing.png', ok=False)
         self.assertEqual(dest.read_bytes(), b'original')
         self.assertFalse((self.base / 'escape.png').exists())
+
+    def test_clipboard_destination_symlink_created_during_capture_is_not_followed(self):
+        outside = self.base / 'outside'
+        outside.mkdir()
+        self.run_cli('clipboard', 'paste', 'capture.png', ok=False, CLIPBOARD_RACE=str(outside))
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue((self.project / 'capture.png').is_symlink())
+        self.assertFalse(list(self.project.glob('.blackhole-clipboard.*')))
 
     def test_status_probes_are_read_only_without_network_or_home(self):
         self.assertIn('shared engine', self.run_cli('status').stdout)

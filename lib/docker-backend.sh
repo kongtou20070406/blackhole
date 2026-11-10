@@ -180,34 +180,8 @@ docker_net_command() {
 clipboard_paste() {
     command -v powershell.exe >/dev/null 2>&1 || die "Windows clipboard requires WSL interop and powershell.exe"
     command -v wslpath >/dev/null 2>&1 || die "Windows clipboard requires wslpath"
+    command -v python3 >/dev/null 2>&1 || die "Windows clipboard requires python3"
     local relative="${1:-.blackhole/clipboard/$(date +%Y%m%d-%H%M%S)-$$.png}"
-    [[ "$relative" != /* && "$relative" != *..* && "$relative" == *.png ]] \
-        || die "clipboard output must be a relative .png path inside the project"
     validate_project
-    local directory destination temporary resolved ancestor
-    directory="${PROJECT_DIR}/$(dirname "$relative")"
-    ancestor="$directory"
-    while [[ ! -d "$ancestor" ]]; do
-        [[ ! -e "$ancestor" && ! -L "$ancestor" ]] || die "clipboard parent is not a directory"
-        ancestor="$(dirname "$ancestor")"
-    done
-    resolved="$(cd "$ancestor" && pwd -P)"
-    [[ "$resolved" == "$PROJECT_DIR" || "$resolved" == "$PROJECT_DIR/"* ]] \
-        || die "clipboard output escapes the project through a symlink"
-    mkdir -p "$directory"
-    resolved="$(cd "$directory" && pwd -P)"
-    [[ "$resolved" == "$PROJECT_DIR" || "$resolved" == "$PROJECT_DIR/"* ]] \
-        || die "clipboard output escapes the project through a symlink"
-    destination="${resolved}/$(basename "$relative")"
-    [[ ! -e "$destination" && ! -L "$destination" ]] || die "clipboard destination already exists"
-    temporary="$(mktemp "${resolved}/.blackhole-clipboard.XXXXXX")"
-    if ! powershell.exe -NoProfile -NonInteractive -STA \
-        -File "$(wslpath -w "${ROOT_DIR}/scripts/clipboard.ps1")" \
-        -OutputPath "$(wslpath -w "$temporary")" >&2; then
-        rm -f "$temporary"
-        die "could not read Windows clipboard image"
-    fi
-    [[ -s "$temporary" ]] || die "clipboard did not produce an image"
-    mv "$temporary" "$destination"
-    printf '/workspace/%s\n' "${destination#"$PROJECT_DIR/"}"
+    python3 "${ROOT_DIR}/scripts/clipboard.py" "$relative" "${ROOT_DIR}/scripts/clipboard.ps1"
 }

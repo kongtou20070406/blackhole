@@ -100,9 +100,11 @@ try:
     with tempfile.TemporaryDirectory(prefix='blackhole-smoke-') as directory:
         base = Path(directory)
         project = base / 'project 空间,"quoted"'
-        project.mkdir(mode=0o777)
-        os.chmod(project, 0o777)
-        expected_uid = os.getuid() or 1000
+        if os.getuid() == 0:
+            raise SystemExit('Run this smoke test as a normal user; use smoke_permissions.py for root-owned mounts')
+        project.mkdir(mode=0o755)
+        os.chmod(project, 0o755)
+        expected_uid = os.getuid()
         home = base / 'home'
         home.mkdir()
         # Wrapper caps the main test container too; relay already has its own

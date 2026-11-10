@@ -199,7 +199,8 @@ Environment:
 Platform features:
   Docker net off/on/status controls profile proxy relays; set BLACKHOLE_PROXY first.
   net-watch and net ipv6 require Colima. Clipboard mirroring requires macOS;
-  WSL2 supports on-demand 'clipboard paste' from the Windows image clipboard.
+  WSL2 'clipboard paste' requires python3 and Windows PowerShell interop.
+  Sessions require a rootful Docker engine; rootless UID mapping is unsupported.
 
 Project tools:
   If ./.blackhole/Dockerfile exists, it is built from the base image and used
@@ -245,6 +246,16 @@ ensure_vm() {
     fi
     docker_vm info >/dev/null 2>&1 \
         || die "cannot connect to Colima profile '${PROFILE}'"
+}
+
+ensure_session_backend() {
+    [[ "$BACKEND" == docker ]] || return 0
+    local security
+    security="$(docker_vm info --format '{{json .SecurityOptions}}')" \
+        || die "cannot inspect Docker security options"
+    if [[ "$security" == *'"name=rootless"'* ]]; then
+        die "rootless Docker is not supported: project files map to container UID 0; select a rootful Docker context accessible to your normal user (do not run Blackhole with sudo)"
+    fi
 }
 
 build_image() {
@@ -2062,6 +2073,7 @@ main() {
             [[ $# -eq 0 ]] || die "shell does not accept arguments"
             require_host_tools
             ensure_vm
+            ensure_session_backend
             validate_project
             resolve_project_image
             ensure_image
@@ -2076,6 +2088,7 @@ main() {
             fi
             require_host_tools
             ensure_vm
+            ensure_session_backend
             validate_project
             resolve_project_image
             ensure_image
@@ -2084,6 +2097,7 @@ main() {
         *)
             require_host_tools
             ensure_vm
+            ensure_session_backend
             validate_project
             resolve_project_image
             ensure_image

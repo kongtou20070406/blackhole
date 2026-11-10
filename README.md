@@ -121,7 +121,7 @@ To uninstall, remove the symlinks (`rm -f ~/.local/bin/claude ~/.local/bin/black
 
 Run the launcher **inside a Linux/WSL2 terminal**. The lightweight route is [Docker Engine in Ubuntu](https://docs.docker.com/engine/install/ubuntu/), reusing your existing WSL2 distribution. Docker Desktop is optional: if already installed, enable its [WSL2 integration](https://docs.docker.com/desktop/features/wsl/). No Colima, nested VM, host Node.js, or host Claude Code installation is needed.
 
-First make `docker info` work as your normal WSL user (see Docker's [post-install instructions](https://docs.docker.com/engine/install/linux-postinstall/) or [rootless mode](https://docs.docker.com/engine/security/rootless/)). Avoid running the launcher with `sudo`, which changes the home directory and profile state. Then, in WSL:
+First make `docker info` work as your normal WSL user with a rootful Docker Engine (see Docker's [post-install instructions](https://docs.docker.com/engine/install/linux-postinstall/)). Rootless Docker is currently unsupported: it maps host-owned project files to container UID 0, which prevents Blackhole's non-root session user from editing ordinary `0755` directories and `0644` files. The launcher rejects rootless sessions before building images or creating containers; select a rootful Docker context accessible to your normal user. Avoid running the launcher with `sudo`, which changes the home directory and profile state. Then, in WSL:
 
 ```bash
 docker info
@@ -258,7 +258,7 @@ blackhole clipboard paste
 blackhole clipboard paste images/screenshot.png
 ```
 
-This invokes Windows PowerShell in STA mode once, reads the image via .NET, and atomically saves a PNG within the mounted project. It preserves the Windows clipboard and refuses traversal, paths escaping through symlinks, and existing destination files. WSL interop and `powershell.exe` must be available. There is no background clipboard polling or automatic TUI key injection. On Linux without Windows interop, put image files in the project instead.
+This invokes Windows PowerShell in STA mode once and returns PNG data via .NET without opening a project path from Windows. A Python helper saves the complete image using pinned directory handles and an atomic hard link that refuses existing targets, including concurrent symlink replacements. Parent-directory symlinks and traversal are rejected. It preserves the Windows clipboard. WSL interop, `powershell.exe`, `wslpath`, Python 3, and a filesystem supporting hard links are required. There is no background clipboard polling or automatic TUI key injection. On Linux without Windows interop, put image files in the project instead.
 
 ### Cross-Process File Signals
 

@@ -45,6 +45,10 @@ integration is optional; do not install it over a working native engine.
 `BLACKHOLE_PROFILE` overrides the legacy `BLACKHOLE_COLIMA_PROFILE` and bindings.
 Docker profiles share one engine/image cache and isolate credential volumes;
 binding a Docker profile does not allocate a new VM.
+Sessions require a rootful engine accessible to the normal user. Rootless
+Docker maps host-owned files to container UID 0 and is explicitly rejected
+before session setup; do not work around this with `sudo`, UID 0 sessions,
+recursive ownership changes, or world-writable project permissions.
 
 When the user wants a separate VM (custom CPU/RAM or isolated Docker/credentials volume) for a specific project directory:
 
@@ -112,7 +116,11 @@ Do not apply Colima iptables scripts to a shared WSL host. VM `net ipv6` and
 
 On WSL2, use `blackhole clipboard paste [relative.png]` after Win+Shift+S.
 It reads the Windows clipboard once via `scripts/clipboard.ps1`, preserves it,
-and saves a PNG inside the current project, printing its `/workspace` path.
+and returns PNG data without passing a project output path to Windows.
+`scripts/clipboard.py` requires host Python 3 and publishes the complete PNG
+inside the project via pinned directory descriptors and a no-clobber hard link,
+printing its `/workspace` path. Never replace this with a checked-path `mv`:
+the running agent can replace paths between validation and publication.
 Do not start the macOS clipboard mirror on WSL or inject keys into Claude's TUI.
 
 - **Block or restore outbound VM internet**:
@@ -151,7 +159,8 @@ To coordinate between a host agent/runner (e.g., Codex or a test harness) and Cl
 | [`bin/blackhole`](bin/blackhole) | macOS / Linux / WSL2 (Bash) | CLI entrypoint, backend/profile resolution, container launcher, Colima daemons |
 | [`lib/docker-backend.sh`](lib/docker-backend.sh) | Linux / WSL2 (Bash) | Docker proxy-only networks, relay lifecycle, profile network controls, Windows clipboard bridge |
 | [`blackhole-proxy.cjs`](blackhole-proxy.cjs) | Unprivileged relay container | TCP forwarding to one explicit upstream HTTP proxy, no direct fallback |
-| [`scripts/clipboard.ps1`](scripts/clipboard.ps1) | Windows (STA PowerShell) | Read clipboard image into an explicitly provided PNG path |
+| [`scripts/clipboard.ps1`](scripts/clipboard.ps1) | Windows (STA PowerShell) | Return clipboard PNG data as base64, without opening project paths |
+| [`scripts/clipboard.py`](scripts/clipboard.py) | WSL2 (Python 3) | Capture clipboard data and atomically publish it within pinned project directories |
 | [`Dockerfile`](Dockerfile) | Colima VM (Build) | Debian `node:22-bookworm-slim` base image, system packages, `@anthropic-ai/claude-code`, helper scripts |
 | [`docker-entrypoint.sh`](docker-entrypoint.sh) | Container (Root -> `node`) | Matches `node` UID/GID to `/workspace`, installs statusLine + `SessionStart`/`SessionEnd` hooks into `/home/node/.claude/settings.json`, records project registry entry, drops privileges via `gosu node` |
 | [`blackhole-session-hook.sh`](blackhole-session-hook.sh) | Container (`node`) | Claude hook (`SessionStart`/`SessionEnd`) updating `/home/node/.claude/blackhole/sessions/<id>.json` and `projects/<hash>.json` |
@@ -170,6 +179,7 @@ To coordinate between a host agent/runner (e.g., Codex or a test harness) and Cl
    - Helper containers spawned by `status`, `scan_registry`, `show_profiles`, `export_session`, or `run_export_watch` must always run with `--network none` and mount the config volume `:ro` (or not at all in `status`) so they never race with an active Claude session.
 3. **Atomic Writes Everywhere**:
    - Host bindings, watcher state files, exported JSONL files, registry JSON files, and signal files must always be written to a temporary file in the same directory (e.g., `${file}.tmp.$$`) and renamed (`mv`) into place.
+   - Clipboard PNGs use a same-directory temporary file and an atomic no-clobber hard link instead of rename, so an existing target cannot be overwritten or followed as a directory. All project operations use directory descriptors and refuse symlink traversal; writes use the already-open temporary file descriptor.
 4. **Fail-Close Network Watchdog**:
    - Any changes to `run_net_watch`, `run_net_guard`, or `net_watch_stop` must preserve fail-close behavior: block network before the first probe, block network if the watcher exits or heartbeat ages out, and keep network blocked on `net-watch stop`.
 5. **Host Launcher vs Container Image Boundary**:
@@ -195,3 +205,7 @@ profile/state directory, bound runtime resources, a controlled local proxy, and
 remove only test-created containers, volumes, and networks afterwards. Check
 direct-route failure, proxy loss, net off/on, non-root execution, and persistence;
 do not authenticate Claude or alter the user's clipboard to run a test.
+Run `python3 tests/smoke_permissions.py IMAGE` against an existing local image
+to verify the local entrypoint with ordinary `0755`/`0644` project permissions,
+root-owned writable Windows-style mounts, and root-owned unwritable mounts.
+This uses a disposable network-disabled container with no host mounts or volumes.

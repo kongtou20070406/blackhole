@@ -121,7 +121,7 @@ export PATH="$HOME/.local/bin:$PATH"
 
 启动器应在 **Linux/WSL2 终端内**运行。轻量路线是在已有的 WSL2 Ubuntu 中使用 [Docker Engine](https://docs.docker.com/engine/install/ubuntu/)。Docker Desktop 为可选项：如果已经安装，启用它的 [WSL2 集成](https://docs.docker.com/desktop/features/wsl/) 即可。不需要 Colima、嵌套虚拟机，也不需要在宿主机安装 Node.js 或 Claude Code。
 
-先确保普通 WSL 用户执行 `docker info` 能成功（参见 Docker [安装后配置](https://docs.docker.com/engine/install/linux-postinstall/)或 [rootless 模式](https://docs.docker.com/engine/security/rootless/)）。避免用 `sudo` 运行启动器，以免改变主目录和 profile 状态。然后在 WSL 中执行：
+先确保普通 WSL 用户可通过 `docker info` 访问 rootful Docker Engine（参见 Docker [安装后配置](https://docs.docker.com/engine/install/linux-postinstall/)）。目前不支持 rootless Docker：它把宿主用户的项目文件映射为容器 UID 0，导致 Blackhole 的非 root 会话用户无法编辑普通的 `0755` 目录和 `0644` 文件。启动器会在构建镜像或创建容器之前拒绝 rootless 会话；请切换到普通用户可访问的 rootful Docker context。避免用 `sudo` 运行启动器，以免改变主目录和 profile 状态。然后在 WSL 中执行：
 
 ```bash
 docker info
@@ -258,7 +258,7 @@ blackhole clipboard paste
 blackhole clipboard paste images/screenshot.png
 ```
 
-命令只调用一次 STA 模式的 Windows PowerShell，经 .NET 读取图片，原子写入挂载项目内的 PNG 文件，不改变 Windows 剪贴板。它会拒绝目录穿越、通过软链接逃出项目的路径，以及已经存在的目标文件。需要启用 WSL interop，且能找到 `powershell.exe`。不进行后台剪贴板轮询或自动注入 TUI 按键。没有 Windows 联动能力的 Linux 环境可以直接把图片放入项目。
+命令只调用一次 STA 模式的 Windows PowerShell，经 .NET 返回 PNG 数据，Windows 端不打开项目路径。Python 辅助程序通过固定的目录句柄保存完整图片，并用原子硬链接拒绝已有目标，也能防止并发替换符号链接导致越界。父目录符号链接和目录穿越均会被拒绝。命令不改变 Windows 剪贴板。需要启用 WSL interop，并提供 `powershell.exe`、`wslpath`、Python 3 和支持硬链接的文件系统。不进行后台剪贴板轮询或自动注入 TUI 按键。没有 Windows 联动能力的 Linux 环境可以直接把图片放入项目。
 
 ### 跨进程文件信号
 
