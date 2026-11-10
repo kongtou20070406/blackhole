@@ -38,6 +38,14 @@ Before making changes, run read-only status checks (these never disturb running 
 
 ### 3. Creating & Binding a Dedicated Colima Profile for a Project
 
+On Linux/WSL2, use the existing Docker Engine instead: `docker info` must work
+for the normal user. `BLACKHOLE_BACKEND=auto` selects Docker on Linux and Colima
+on macOS. Do not install Colima or add a nested VM on WSL2. Docker Desktop WSL2
+integration is optional; do not install it over a working native engine.
+`BLACKHOLE_PROFILE` overrides the legacy `BLACKHOLE_COLIMA_PROFILE` and bindings.
+Docker profiles share one engine/image cache and isolate credential volumes;
+binding a Docker profile does not allocate a new VM.
+
 When the user wants a separate VM (custom CPU/RAM or isolated Docker/credentials volume) for a specific project directory:
 
 ```bash
@@ -91,6 +99,22 @@ macOS binaries (`/opt/homebrew/bin`) are Mach-O and cannot be mounted into the L
 
 ### 6. Network Control & Fail-Close Proxy Protection (`net` / `net-watch`)
 
+The commands below describe Colima. For Docker/WSL2, launch with
+`BLACKHOLE_PROXY=http://host:port` (an HTTP proxy reachable from containers).
+The endpoint is saved per profile. Each session joins an internal network and
+uses an unprivileged TCP relay capped at 64 MiB/0.25 CPU with no host ports,
+project mounts, credentials, or Linux capabilities. There is no direct external
+route when the upstream is down, and no polling daemon. `net off/on/status`
+controls only these relays; `net off` also latches new sessions offline.
+Existing unguarded sessions must be restarted before this protection applies.
+Do not apply Colima iptables scripts to a shared WSL host. VM `net ipv6` and
+`net-watch` remain Colima-only. The upstream proxy's routing determines exit IP.
+
+On WSL2, use `blackhole clipboard paste [relative.png]` after Win+Shift+S.
+It reads the Windows clipboard once via `scripts/clipboard.ps1`, preserves it,
+and saves a PNG inside the current project, printing its `/workspace` path.
+Do not start the macOS clipboard mirror on WSL or inject keys into Claude's TUI.
+
 - **Block or restore outbound VM internet**:
   ```bash
   blackhole net off --all          # or --profile <name>
@@ -124,7 +148,10 @@ To coordinate between a host agent/runner (e.g., Codex or a test harness) and Cl
 
 | File | Runs Where | Responsibility |
 | --- | --- | --- |
-| [`bin/blackhole`](bin/blackhole) | macOS Host (Bash) | CLI entrypoint (`blackhole` and `claude` symlink target), profile resolution, container launcher, `net` / `net-watch` / `export-watch` / `clipboard` daemons |
+| [`bin/blackhole`](bin/blackhole) | macOS / Linux / WSL2 (Bash) | CLI entrypoint, backend/profile resolution, container launcher, Colima daemons |
+| [`lib/docker-backend.sh`](lib/docker-backend.sh) | Linux / WSL2 (Bash) | Docker proxy-only networks, relay lifecycle, profile network controls, Windows clipboard bridge |
+| [`blackhole-proxy.cjs`](blackhole-proxy.cjs) | Unprivileged relay container | TCP forwarding to one explicit upstream HTTP proxy, no direct fallback |
+| [`scripts/clipboard.ps1`](scripts/clipboard.ps1) | Windows (STA PowerShell) | Read clipboard image into an explicitly provided PNG path |
 | [`Dockerfile`](Dockerfile) | Colima VM (Build) | Debian `node:22-bookworm-slim` base image, system packages, `@anthropic-ai/claude-code`, helper scripts |
 | [`docker-entrypoint.sh`](docker-entrypoint.sh) | Container (Root -> `node`) | Matches `node` UID/GID to `/workspace`, installs statusLine + `SessionStart`/`SessionEnd` hooks into `/home/node/.claude/settings.json`, records project registry entry, drops privileges via `gosu node` |
 | [`blackhole-session-hook.sh`](blackhole-session-hook.sh) | Container (`node`) | Claude hook (`SessionStart`/`SessionEnd`) updating `/home/node/.claude/blackhole/sessions/<id>.json` and `projects/<hash>.json` |
@@ -157,3 +184,14 @@ Whenever you add or modify a subcommand, flag, or environment variable in [`bin/
 1. Update `usage()` in [`bin/blackhole`](bin/blackhole).
 2. Update both [`README.md`](README.md) (English) and [`README.zh-CN.md`](README.zh-CN.md) (Chinese), maintaining 1:1 structural parity (identical heading count, table count, code block count, and valid relative links).
 3. Update this [`AGENTS.md`](AGENTS.md) if the operational workflow or architecture changed.
+
+### 4. Verification
+
+Run `python3 -m unittest discover -s tests -v`. Launcher tests use fake engine
+commands and never start a VM/container or contact an API. Relay tests use Node
+and local sockets only (skipped if host Node is absent). CI runs on Linux and
+macOS, including the system Bash. For real Docker smoke tests, use a unique
+profile/state directory, bound runtime resources, a controlled local proxy, and
+remove only test-created containers, volumes, and networks afterwards. Check
+direct-route failure, proxy loss, net off/on, non-root execution, and persistence;
+do not authenticate Claude or alter the user's clipboard to run a test.
