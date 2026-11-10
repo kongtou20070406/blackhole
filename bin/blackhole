@@ -37,6 +37,14 @@ die() {
     exit 1
 }
 
+format_columns() {
+    if command -v column >/dev/null 2>&1; then
+        column -t -s $'\t'
+    else
+        cat
+    fi
+}
+
 resolve_backend() {
     if [[ "$BACKEND" == auto ]]; then
         case "$HOST_OS" in
@@ -144,7 +152,7 @@ profile_bindings() {
         printf 'No bound projects.\n'
         return 0
     fi
-    { printf 'PATH\tPROFILE\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+    { printf 'PATH\tPROFILE\n'; printf '%s' "$rows"; } | format_columns
 }
 
 usage() {
@@ -201,6 +209,7 @@ Platform features:
   net-watch and net ipv6 require Colima. Clipboard mirroring requires macOS;
   WSL2 'clipboard paste' requires python3 and Windows PowerShell interop.
   Sessions require a rootful Docker engine; rootless UID mapping is unsupported.
+  Lists use tab-separated output when the optional 'column' utility is absent.
 
 Project tools:
   If ./.blackhole/Dockerfile exists, it is built from the base image and used
@@ -611,7 +620,7 @@ show_registry() {
     fi
 
     { printf '%s\n' "$header"; printf '%s\n' "$rows"; } \
-        | column -t -s $'\t'
+        | format_columns
 }
 
 show_profiles() {
@@ -651,7 +660,7 @@ show_profiles() {
             printf '%s\t%s\t%sGiB\t%s\t%s\t%s\t%s\n' \
                 "$profile" "$status" "$memory" "$initialized" "$projects" "$sessions" "$last"
         fi
-    done <<< "$records" | column -t -s $'\t'
+    done <<< "$records" | format_columns
 }
 
 select_session_row() {
@@ -667,7 +676,7 @@ select_session_row() {
         || die "no session matches '${prefix}'${want_profile:+ on profile '${want_profile}'}; start that profile first"
     count="$(printf '%s\n' "$matches" | wc -l | tr -d ' ')"
     if [[ "$count" != 1 ]]; then
-        printf '%s\n' "$matches" | column -t -s $'\t' >&2
+        printf '%s\n' "$matches" | format_columns >&2
         die "session prefix '${prefix}' is ambiguous; add --profile NAME"
     fi
 
@@ -991,7 +1000,7 @@ export_watch_status() {
         return 0
     fi
     { printf 'PROFILE\tSESSION\tPID\tSTATUS\tLAST EXPORT\n'; printf '%s' "$rows"; } \
-        | column -t -s $'\t'
+        | format_columns
 }
 
 export_watch_stop() {
@@ -1176,7 +1185,7 @@ net_command() {
     done
 
     if [[ "$action" == status ]]; then
-        { printf 'PROFILE\tNETWORK\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+        { printf 'PROFILE\tNETWORK\n'; printf '%s' "$rows"; } | format_columns
     fi
     return 0
 }
@@ -1677,7 +1686,7 @@ net_ipv6_command() {
     done
 
     if [[ "$action" == status ]]; then
-        { printf 'PROFILE\tIPV6\n'; printf '%s' "$rows"; } | column -t -s $'\t'
+        { printf 'PROFILE\tIPV6\n'; printf '%s' "$rows"; } | format_columns
     fi
     return 0
 }

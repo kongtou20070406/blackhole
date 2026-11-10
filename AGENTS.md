@@ -110,6 +110,9 @@ uses an unprivileged TCP relay capped at 64 MiB/0.25 CPU with no host ports,
 project mounts, credentials, or Linux capabilities. There is no direct external
 route when the upstream is down, and no polling daemon. `net off/on/status`
 controls only these relays; `net off` also latches new sessions offline.
+Guarded sessions set `--dns 127.0.0.1` to avoid inherited host DNS forwarding
+on older Docker engines; retain local relay alias resolution and never remove
+this override without verifying DNS confinement as well as TCP confinement.
 Existing unguarded sessions must be restarted before this protection applies.
 Do not apply Colima iptables scripts to a shared WSL host. VM `net ipv6` and
 `net-watch` remain Colima-only. The upstream proxy's routing determines exit IP.

@@ -189,6 +189,19 @@ class LauncherTests(unittest.TestCase):
         self.assertNotIn('unrelated', result.stdout)
         self.assertEqual(self.calls('colima'), [])
 
+    def test_lists_work_without_optional_column_utility(self):
+        startup = self.base / 'without-column.bash'
+        startup.write_text('''command() {
+    if [[ "$*" == "-v column" ]]; then return 1; fi
+    builtin command "$@"
+}
+''')
+        self.run_cli('bind', 'work')
+        for command in ('profiles', 'bindings', 'projects', 'sessions'):
+            result = self.run_cli(command, BASH_ENV=str(startup), REGISTRY_ROWS='1')
+            self.assertIn('\t', result.stdout)
+        self.assertEqual(self.calls('column'), [])
+
     def test_generic_profile_override_precedes_legacy_and_binding(self):
         self.run_cli('bind', 'bound')
         self.run_cli('-p', 'test', BLACKHOLE_PROFILE='generic', BLACKHOLE_COLIMA_PROFILE='legacy')
@@ -219,6 +232,8 @@ class LauncherTests(unittest.TestCase):
         args = self.launched()[0]
         self.assertEqual(args[args.index('--network') + 1], network[-1])
         self.assertIn('HTTPS_PROXY=http://blackhole-proxy:3128', args)
+        self.assertEqual(args[args.index('--dns') + 1], '127.0.0.1')
+        self.assertNotIn('--dns', relay)
         self.assertTrue(any(a[:2] == ['rm', '-f'] for a in calls))
         self.assertTrue(any(a[:2] == ['network', 'rm'] for a in calls))
         self.run_cli('-p', 'new terminal')

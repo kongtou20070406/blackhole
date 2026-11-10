@@ -145,6 +145,8 @@ macOS 默认使用 `colima` 后端，Linux/WSL2 默认使用 `docker`，可通�
 
 普通会话不新增 watcher 或 Docker 之外的常驻服务。仅代理会话使用同一镜像启动一个非特权 Node 转发进程，限制为 **64 MiB 内存和 0.25 CPU**，正常退出时自动删除。不申请 GPU。每个仅代理会话都有独立的内部网络，转发进程退出时一并删除空闲网络。若启动器被强制杀死，可能需要手动清理带标签的转发容器/会话容器。
 
+`column` 是可选工具：未安装时，profile、绑定、项目和会话列表会回退为制表符分隔的输出。
+
 ## 命令与配置
 
 ### 子命令速查
@@ -242,6 +244,8 @@ blackhole net on
 ```
 
 Claude 只接入 Docker `--internal` 网络。一个非特权转发进程把 TCP 流量转发到指定代理，不挂载项目或凭据，也不发布宿主机端口。`HTTP_PROXY`/`HTTPS_PROXY` 及其小写变量指向该转发进程。不遵循这些变量的程序无法访问外网。代理或转发进程停止后，容器无法回退到直接访问外网，因此无需 TUN 轮询或心跳进程。最终出口 IP 仍由上游代理自身的路由规则决定；这一功能不提供账号匿名化，也不是对抗恶意内核的沙盒。
+
+受保护的会话显式使用容器本地 DNS 上游（`127.0.0.1`），保留 Docker 对本地转发进程别名的解析，同时避免受 [CVE-2024-29018](https://github.com/moby/moby/security/advisories/GHSA-mq39-4gv4-mvpx) 影响的旧版引擎通过宿主机转发 DNS 查询。转发进程仍正常解析已配置的上游地址。
 
 代理地址保存在 `~/.blackhole/docker-proxy/<profile>.proxy`，新终端也会沿用，避免意外直连。`net off` 只停止该 profile 的转发进程，并让后续会话保持断网；`net on` 可重新启动。两者均不修改其他 WSL 服务或 Docker 容器的网络。已经启动的普通会话需要先用代理模式重启，才能受到网络控制保护。状态检查会读取运行中的容器；保护不完整时显示 `unguarded-sessions` 或 `BLOCK-FAILED`，不会误报隔离成功。`--all` 会尝试控制全部已配置的 profile，只要有 profile 无法控制就返回错误。`net-watch` 和 VM 级 `net ipv6` 仍仅适用于 Colima。如果明确要恢复某 profile 的普通 Docker 网络，应先结束其会话，再删除对应的 `.proxy` 和 `.proxy.blocked` 状态文件。
 

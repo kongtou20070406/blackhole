@@ -82,7 +82,11 @@ prepare_proxy() {
             || die "proxy relay did not start; rebuild the Blackhole image with setup"
     fi
     proxy_unlock
-    run_args+=(--network "$GUARD_NETWORK" --label dev.blackhole.guard=proxy)
+    # Do not inherit the host's upstream DNS. On older engines the embedded
+    # resolver can forward queries from internal networks via a host loopback
+    # resolver (CVE-2024-29018). Explicit DNS keeps queries in this namespace;
+    # Docker still resolves the relay's local network alias.
+    run_args+=(--network "$GUARD_NETWORK" --dns 127.0.0.1 --label dev.blackhole.guard=proxy)
     local variable
     for variable in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
         run_args+=(-e "${variable}=http://blackhole-proxy:3128")

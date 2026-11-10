@@ -135,6 +135,9 @@ try:
         shell.stdin.flush()
         marker = f'UID={expected_uid}'
         assert marker in until(shell, marker)
+        sessions = docker('ps', '-q', '--filter', 'label=dev.blackhole.session=1', '--filter', f'label=dev.blackhole.profile={PROFILE}').split()
+        assert len(sessions) == 1
+        assert json.loads(docker('inspect', sessions[0]))[0]['HostConfig']['Dns'] == ['127.0.0.1']
         send(shell, "require('fs').writeFileSync('/workspace/persist.txt','saved'); console.log('WRITE_OK')", 'WRITE_OK')
         assert (project / 'persist.txt').read_text() == 'saved'
         send(shell, proxy_ok, 'PROXY_OK')

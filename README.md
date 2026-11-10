@@ -145,6 +145,8 @@ The backend defaults to `colima` on macOS and `docker` on Linux/WSL2. `BLACKHOLE
 
 Ordinary sessions add no watcher or extra daemon beyond Docker. Proxy-only sessions add one unprivileged Node relay using the same image, capped at **64 MiB RAM and 0.25 CPU**, removed on normal session exit. No GPU is requested. Each proxy session has its own internal network; idle networks are removed with the relay. A forcibly killed launcher may need its labeled relay/container cleaned up manually.
 
+The `column` utility is optional: profile, binding, project, and session lists fall back to tab-separated output when it is unavailable.
+
 ## CLI & Configuration
 
 ### Subcommands
@@ -242,6 +244,8 @@ blackhole net on
 ```
 
 Claude joins only a Docker `--internal` network. An unprivileged relay, with no project/credential mounts or published ports, forwards TCP to the configured proxy. `HTTP_PROXY`/`HTTPS_PROXY` and their lowercase equivalents point to this relay. Programs ignoring these variables fail to reach the internet. A stopped proxy or relay cannot fall back to a direct external route, so no TUN polling or heartbeat process is needed. The upstream proxy's own routing policy still determines its public exit IP; this does not anonymize accounts or sandbox a hostile kernel.
+
+Guarded sessions use an explicit container-local DNS upstream (`127.0.0.1`), retaining Docker's local relay alias resolution while preventing inherited host DNS forwarding on older engines affected by [CVE-2024-29018](https://github.com/moby/moby/security/advisories/GHSA-mq39-4gv4-mvpx). The relay resolves its configured upstream normally.
 
 The endpoint persists at `~/.blackhole/docker-proxy/<profile>.proxy`, preventing accidental direct access in a fresh terminal. `net off` stops only that profile's relays and latches future sessions offline; `net on` restarts them. Neither command changes networking for other WSL services or Docker containers. Existing unguarded sessions must be restarted with proxy mode before network controls can protect them. Status checks running containers: it reports `unguarded-sessions` or `BLOCK-FAILED` instead of claiming isolation when protection is incomplete. `--all` attempts all configured profiles and returns an error if any profile cannot be controlled. `net-watch` and VM-wide `net ipv6` remain Colima-only. To deliberately return a profile to ordinary Docker networking, end its sessions and remove its `.proxy` and `.proxy.blocked` state files.
 
