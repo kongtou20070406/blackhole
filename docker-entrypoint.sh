@@ -6,6 +6,13 @@ set -euo pipefail
 workspace_uid="$(stat -c '%u' /workspace)"
 workspace_gid="$(stat -c '%g' /workspace)"
 
+# Windows bind mounts can appear root-owned. Keep the existing unprivileged
+# node identity in that case instead of turning node into UID 0.
+if [[ "$workspace_uid" == 0 ]]; then
+    workspace_uid="$(id -u node)"
+    workspace_gid="$(id -g node)"
+fi
+
 groupmod -o -g "$workspace_gid" node
 usermod -o -u "$workspace_uid" -g "$workspace_gid" node
 
